@@ -1,0 +1,20 @@
+In the context of the existing architecture of the applicaiton defined in the @ID_payments.md create a new md file for the analysis and new steps to be considered for the proposed changes
+
+1. The trigger point as of now is solace message or a message from the queue. but going forward a new UI is introduced for uploading the pdfs directly into the UI which is later processed by the backend.
+2. the document uploaded is stored in the one of the file storing medium which the document-service api already provides
+3. there is OCR based call to SWOOSH system as part of extraction of the data from the document uploaded.. which is as of now received from the solace mesage queue.  we are moving out of it into a new AI Factory solution. once the OCR ouput is received rest of the process remains the same
+
+Considering the above changes as part new intialition only for the Indonasia payments of ID payment.. how do re architecture the system making sure the existing flow orther BPMN flow and applicaitons are not distubed.. and exising common services are resused and a proper auditable flow is maintained for the new approach of payment sytem for indonasia..
+
+Provide the old state and new state of changes with table design
+
+
+-------------------------------------------------------------------
+
+I wish to go with entirely new BPMN workflow in the worflow=management.. so it will be good to rollaback with just a feature flag changes. but the question is do I still to use the existing gateway service and even the name does not look the best for me.. what do u think?
+
+
+-------------------------------------------------------------------
+
+Lets think targetting the future perspective.. its never that new service is just limited to indonasia payments.. a incremental rewrite for all the payment supporting countries happen as per the list of BPMN in the @ID_payments.md file.. so lets make a better design considering all the factors are future extensibility
+
