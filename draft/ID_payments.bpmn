@@ -1,0 +1,644 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:bioc="http://bpmn.io/schema/bpmn/biocolor/1.0" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="Definitions_1t1lv1p" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="4.6.0">
+  <bpmn:process id="IAP_ID_Payments" name="IAP_ID_Payments" isExecutable="true" camunda:historyTimeToLive="100000">
+    <bpmn:startEvent id="IAP_ID_AutomatedTrigger" name="IAP_ID_AutomatedTrigger">
+      <bpmn:outgoing>SequenceFlow_04v6wbw</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_1jtj4y2" messageRef="Message_00vzidh" />
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_0v2bji8" sourceRef="Derive_Client_from_AccountNumber" targetRef="Save_Payment_Transaction" />
+    <bpmn:userTask id="IAP_ID_CheckerPayment" name="IAP_ID_CheckerPayment" camunda:assignee="${paymentChecker}">
+      <bpmn:documentation>${lastUpdatedUser}</bpmn:documentation>
+      <bpmn:incoming>Flow_04aob20</bpmn:incoming>
+      <bpmn:incoming>RepairFree</bpmn:incoming>
+      <bpmn:incoming>Flow_0flkyeb</bpmn:incoming>
+      <bpmn:outgoing>Flow_0axaqhk</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="Flow_12eshdy" sourceRef="Save_Payment_Transaction" targetRef="PaymentValidationGateway" />
+    <bpmn:exclusiveGateway id="CheckerApprovalGateway" name="CheckerApprovalGateway">
+      <bpmn:incoming>Flow_0axaqhk</bpmn:incoming>
+      <bpmn:incoming>Flow_12mndij</bpmn:incoming>
+      <bpmn:outgoing>ReworkPaymentRequest</bpmn:outgoing>
+      <bpmn:outgoing>PaymentApproved</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="Flow_0axaqhk" sourceRef="IAP_ID_CheckerPayment" targetRef="CheckerApprovalGateway" />
+    <bpmn:userTask id="IAP_ID_MakerPayment" name="IAP_ID_MakerPayment" camunda:assignee="${paymentMaker}">
+      <bpmn:incoming>ReworkPaymentRequest</bpmn:incoming>
+      <bpmn:incoming>ReworkPayment</bpmn:incoming>
+      <bpmn:incoming>ToBeRepaired</bpmn:incoming>
+      <bpmn:incoming>Flow_0owiip3</bpmn:incoming>
+      <bpmn:incoming>SequenceFlow_0rsktes</bpmn:incoming>
+      <bpmn:outgoing>Flow_04aob20</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="ReworkPaymentRequest" name="ReworkPaymentRequest" sourceRef="CheckerApprovalGateway" targetRef="IAP_ID_MakerPayment">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${isApproved==false}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:serviceTask id="Derive_Client_from_AccountNumber" name="Derive Client from AccountNumber" camunda:type="external" camunda:topic="Derive_Client_from_AccountNumber">
+      <bpmn:incoming>Flow_1cdnr67</bpmn:incoming>
+      <bpmn:outgoing>Flow_0v2bji8</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Save_Payment_Transaction" name="Save Payment Transaction" camunda:type="external" camunda:topic="Save_Payment_Transaction">
+      <bpmn:incoming>Flow_0v2bji8</bpmn:incoming>
+      <bpmn:outgoing>Flow_12eshdy</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="PaymentApproved" name="PaymentApproved" sourceRef="CheckerApprovalGateway" targetRef="VerifyPaymentCutoffStatus">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${isApproved==true}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:serviceTask id="VerifyPaymentCutoffStatus" name="Verify Payment cut-off and set payment status" camunda:type="external" camunda:topic="Verify_PaymentCutoffStatus">
+      <bpmn:incoming>PaymentApproved</bpmn:incoming>
+      <bpmn:outgoing>Flow_1dp2ke5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="PaymentCheckGateway" name="PaymentCheckGateway">
+      <bpmn:incoming>Flow_1dp2ke5</bpmn:incoming>
+      <bpmn:outgoing>ProceedWithPayment</bpmn:outgoing>
+      <bpmn:outgoing>ReworkPayment</bpmn:outgoing>
+      <bpmn:outgoing>Flow_0flkyeb</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="Flow_1dp2ke5" sourceRef="VerifyPaymentCutoffStatus" targetRef="PaymentCheckGateway" />
+    <bpmn:exclusiveGateway id="FutureDateValidationGateway" name="FutureDateValidationGateway">
+      <bpmn:incoming>ProceedWithPayment</bpmn:incoming>
+      <bpmn:outgoing>FutureDatedTransaction</bpmn:outgoing>
+      <bpmn:outgoing>CurrentDatedTransaction</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="ProceedWithPayment" name="ProceedWithPayment" sourceRef="PaymentCheckGateway" targetRef="FutureDateValidationGateway">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${proceedPayment==true}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:userTask id="IAP_ID_Claim_Payment" name="IAP_ID_Claim_Payment" camunda:assignee="${paymentMaker}">
+      <bpmn:incoming>Flow_18qm3su</bpmn:incoming>
+      <bpmn:outgoing>Flow_0owiip3</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="Flow_1if6k56" sourceRef="OTT_Payment_Mode_Value_Date" targetRef="Derive_Suspense_Account_Local_Charges" />
+    <bpmn:sequenceFlow id="Flow_0d2veoc" sourceRef="Enrich_Internal_Account_Details" targetRef="Enrich_External_Account_Details" />
+    <bpmn:sequenceFlow id="Flow_1cdnr67" sourceRef="Enrich_External_Account_Details" targetRef="Derive_Client_from_AccountNumber" />
+    <bpmn:serviceTask id="OTT_Payment_Mode_Value_Date" name="OTT Payment Mode Value Date" camunda:type="external" camunda:topic="OTT_Payment_Mode_Value_Date">
+      <bpmn:incoming>Flow_01utti5</bpmn:incoming>
+      <bpmn:outgoing>Flow_1if6k56</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_0d5f5n5" sourceRef="Derive_Suspense_Account_Local_Charges" targetRef="Enrich_Internal_Account_Details" />
+    <bpmn:serviceTask id="Derive_Suspense_Account_Local_Charges" name="Derive Suspense Account Local Charges" camunda:type="external" camunda:topic="Derive_Suspense_Account_Local_Charges">
+      <bpmn:incoming>Flow_1if6k56</bpmn:incoming>
+      <bpmn:outgoing>Flow_0d5f5n5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Enrich_Internal_Account_Details" name="Enrich Internal Account Details" camunda:type="external" camunda:topic="Enrich_Internal_Account_Details">
+      <bpmn:incoming>Flow_0d5f5n5</bpmn:incoming>
+      <bpmn:outgoing>Flow_0d2veoc</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Enrich_External_Account_Details" name="Enrich External Account Details" camunda:type="external" camunda:topic="Enrich_External_Account_Details">
+      <bpmn:incoming>Flow_0d2veoc</bpmn:incoming>
+      <bpmn:outgoing>Flow_1cdnr67</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_01utti5" sourceRef="Initialize_IAP_ID_Payments" targetRef="OTT_Payment_Mode_Value_Date" />
+    <bpmn:sequenceFlow id="Flow_04aob20" name="Submit for Checker Review" sourceRef="IAP_ID_MakerPayment" targetRef="IAP_ID_CheckerPayment" />
+    <bpmn:sequenceFlow id="ReworkPayment" name="ReworkPayment" sourceRef="PaymentCheckGateway" targetRef="IAP_ID_MakerPayment">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${proceedPayment=="false" and isRepaired=="true"}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_1riju20" sourceRef="Event_0kavmph" targetRef="PaymentStatusToComplete" />
+    <bpmn:endEvent id="Event_1c15k4d" name="End">
+      <bpmn:incoming>Flow_Oukufw2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_1fzrdou" sourceRef="PaymentStatusToComplete" targetRef="PublishPaymentStatusAndSSTMFeedback" />
+    <bpmn:sequenceFlow id="Flow_Oukufw2" sourceRef="PublishPaymentStatusAndSSTMFeedback" targetRef="Event_1c15k4d" />
+    <bpmn:serviceTask id="PaymentStatusToComplete" name="Set Payment Status to Completed" camunda:type="external" camunda:topic="Payment_Status_To_Complete">
+      <bpmn:incoming>Flow_1riju20</bpmn:incoming>
+      <bpmn:outgoing>Flow_1fzrdou</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="PublishPaymentStatusAndSSTMFeedback" name="Publish Payment Status and Feedback to SSTM" camunda:type="external" camunda:topic="PublishPaymentStatus_SSTMFeedback">
+      <bpmn:incoming>Flow_1fzrdou</bpmn:incoming>
+      <bpmn:incoming>Flow_02ontnz</bpmn:incoming>
+      <bpmn:outgoing>Flow_Oukufw2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="PaymentValidationGateway" name="PaymentValidationGateway">
+      <bpmn:incoming>Flow_12eshdy</bpmn:incoming>
+      <bpmn:outgoing>RepairFree</bpmn:outgoing>
+      <bpmn:outgoing>ToBeRepaired</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="RepairFree" name="RepairFree" sourceRef="PaymentValidationGateway" targetRef="IAP_ID_CheckerPayment">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${isRepaired==false and isApproved==false}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="ToBeRepaired" name="ToBeRepaired" sourceRef="PaymentValidationGateway" targetRef="IAP_ID_MakerPayment">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${isRepaired==true}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="FutureDatedTransaction" name="FutureDatedTransaction" sourceRef="FutureDateValidationGateway" targetRef="Payment_Status_OnHold">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${isFutureDate==true}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_0rs5o3k" sourceRef="ValueDateReached" targetRef="QueueForPaymentGeneration" />
+    <bpmn:serviceTask id="QueueForPaymentGeneration" name="QueuePaymentForGeneration" camunda:type="external" camunda:topic="Queue_For_PaymentGeneration">
+      <bpmn:incoming>Flow_0rs5o3k</bpmn:incoming>
+      <bpmn:incoming>CurrentDatedTransaction</bpmn:incoming>
+      <bpmn:outgoing>Flow_067megy</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_067megy" sourceRef="QueueForPaymentGeneration" targetRef="Event_0kavmph" />
+    <bpmn:sequenceFlow id="CurrentDatedTransaction" name="CurrentDatedTransaction" sourceRef="FutureDateValidationGateway" targetRef="QueueForPaymentGeneration">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${isFutureDate==false}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:intermediateCatchEvent id="Event_0kavmph" name="File Generated">
+      <bpmn:incoming>Flow_067megy</bpmn:incoming>
+      <bpmn:outgoing>Flow_1riju20</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_122axda" messageRef="Message_1sme7co" />
+    </bpmn:intermediateCatchEvent>
+    <bpmn:boundaryEvent id="ValueDateReached" name="ValueDateReached" attachedToRef="IAP_ID_Claim_Payment">
+      <bpmn:outgoing>Flow_0rs5o3k</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_0hg93rf" messageRef="Message_1gi791u" />
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_18qm3su" sourceRef="Payment_Status_OnHold" targetRef="IAP_ID_Claim_Payment" />
+    <bpmn:serviceTask id="Payment_Status_OnHold" name="Set Payment Status to &#34;On Hold&#34;" camunda:type="external" camunda:topic="Payment_Status_OnHold">
+      <bpmn:incoming>FutureDatedTransaction</bpmn:incoming>
+      <bpmn:outgoing>Flow_18qm3su</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_0owiip3" name="Claim task" sourceRef="IAP_ID_Claim_Payment" targetRef="IAP_ID_MakerPayment" />
+    <bpmn:serviceTask id="Initialize_IAP_ID_Payments" name="Initialize IAP ID Payments" camunda:type="external" camunda:topic="Initialize_IAP_ID_Payments">
+      <bpmn:incoming>SequenceFlow_1e0z7n9</bpmn:incoming>
+      <bpmn:incoming>Flow_0af90pb</bpmn:incoming>
+      <bpmn:incoming>Flow_IDP_To_IAP_ID_Init</bpmn:incoming>
+      <bpmn:outgoing>Flow_01utti5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="CancelPaymentInstruction" name="CancelPaymentInstruction" attachedToRef="IAP_ID_MakerPayment">
+      <bpmn:outgoing>Flow_0uds9qs</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_15eva4w" messageRef="Message_0z2vtqb" />
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_0uds9qs" sourceRef="CancelPaymentInstruction" targetRef="PaymentCancellation" />
+    <bpmn:serviceTask id="PaymentCancellation" name="Set Payment Status to &#34;Cancelled&#34;" camunda:type="external" camunda:topic="Payment_Status_Cancelled">
+      <bpmn:incoming>Flow_0uds9qs</bpmn:incoming>
+      <bpmn:outgoing>Flow_02ontnz</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_02ontnz" sourceRef="PaymentCancellation" targetRef="PublishPaymentStatusAndSSTMFeedback" />
+    <bpmn:startEvent id="IAP_ID_Manual_Payment" name="IAP_ID_Manual_Payment">
+      <bpmn:outgoing>SequenceFlow_0rsktes</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="SequenceFlow_0rsktes" sourceRef="IAP_ID_Manual_Payment" targetRef="IAP_ID_MakerPayment" />
+    <bpmn:sequenceFlow id="SequenceFlow_1e0z7n9" sourceRef="Initialize_IAP_Payments" targetRef="Initialize_IAP_ID_Payments" />
+    <bpmn:sequenceFlow id="SequenceFlow_04v6wbw" sourceRef="IAP_ID_AutomatedTrigger" targetRef="Initialize_IAP_Payments" />
+    <bpmn:serviceTask id="Initialize_IAP_Payments" name="Initialize IAP Payments" camunda:type="external" camunda:topic="Initialize_IAP_Payments">
+      <bpmn:incoming>SequenceFlow_04v6wbw</bpmn:incoming>
+      <bpmn:outgoing>SequenceFlow_1e0z7n9</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Initialize_IAP_Bulk_Payments" name="Initialize IAP Bulk Payments" camunda:type="external" camunda:topic="Initialize_IAP_Bulk_Payments">
+      <bpmn:incoming>Flow_0e7m2ai</bpmn:incoming>
+      <bpmn:outgoing>Flow_0af90pb</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_0af90pb" sourceRef="Initialize_IAP_Bulk_Payments" targetRef="Initialize_IAP_ID_Payments" />
+    <bpmn:startEvent id="IAP_ID_BulkTrigger" name="IAP_ID_BulkTrigger">
+      <bpmn:outgoing>Flow_0e7m2ai</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_193nolg" messageRef="Message_0wv9miu" />
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_0e7m2ai" sourceRef="IAP_ID_BulkTrigger" targetRef="Initialize_IAP_Bulk_Payments" />
+    <bpmn:sequenceFlow id="Flow_0flkyeb" sourceRef="PaymentCheckGateway" targetRef="IAP_ID_CheckerPayment">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${proceedPayment=="false" and isRepaired=="false"}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_12mndij" sourceRef="PaymentValidationGateway" targetRef="CheckerApprovalGateway">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${isRepaired==false and isApproved==true}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:startEvent id="IAP_ID_IDP_Trigger" name="IAP_ID_IDP_Trigger">
+      <bpmn:outgoing>Flow_IDP_Trigger_Init</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_IAP_ID_IDP_Trigger" messageRef="Message_IAP_ID_IDP_Trigger" />
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_IDP_Trigger_Init" sourceRef="IAP_ID_IDP_Trigger" targetRef="Initialize_IAP_From_IDP" />
+    <bpmn:serviceTask id="Initialize_IAP_From_IDP" name="Initialize IAP From IDP" camunda:type="external" camunda:topic="Initialize_IAP_From_IDP">
+      <bpmn:incoming>Flow_IDP_Trigger_Init</bpmn:incoming>
+      <bpmn:outgoing>Flow_IDP_To_IAP_ID_Init</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_IDP_To_IAP_ID_Init" sourceRef="Initialize_IAP_From_IDP" targetRef="Initialize_IAP_ID_Payments" />
+    <bpmn:textAnnotation id="TextAnnotation_IDP_IDP_Trigger">
+      <bpmn:text>Triggered upon Checker approval in IDP_Document_Ingestion.bpmn via message IAP_ID_IDP_Trigger (Trigger_IDP_Payment handler)</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_IDP_IDP_Trigger" sourceRef="IAP_ID_IDP_Trigger" targetRef="TextAnnotation_IDP_IDP_Trigger" />
+    <bpmn:textAnnotation id="TextAnnotation_Initialize_IAP_From_IDP">
+      <bpmn:text>Load structured JSON from IDP extraction job; map to Payment/Message; channel=IDP_UPLOAD</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Initialize_IAP_From_IDP" sourceRef="Initialize_IAP_From_IDP" targetRef="TextAnnotation_Initialize_IAP_From_IDP" />
+    <bpmn:textAnnotation id="TextAnnotation_1990p51">
+      <bpmn:text>Target Payment Status:
+      
+- Validation Errors - TO BE REPAIRED
+- Successful Validation - TO BE REVIEWED</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_1bpxnqd" sourceRef="Save_Payment_Transaction" targetRef="TextAnnotation_1990p51" />
+    <bpmn:textAnnotation id="TextAnnotation_14ch0ki">
+      <bpmn:text>Handles Initialization of Indonesia specific fields</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_1kx13c6" sourceRef="Initialize_IAP_ID_Payments" targetRef="TextAnnotation_14ch0ki" />
+    <bpmn:textAnnotation id="TextAnnotation_1t5s6kk">
+      <bpmn:text>Derive OTT payment mode based on amount.
+
+Check cut-off time based on currency cut-off and update payment mode and value date
+
+If the client has preferred RTGS mode, then the explicit derivation would not happen</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_08dnw4l" sourceRef="OTT_Payment_Mode_Value_Date" targetRef="TextAnnotation_1t5s6kk" />
+    <bpmn:textAnnotation id="TextAnnotation_15j8fis">
+      <bpmn:text>Verify that the payment mode chosen is still valid for the given time and update the status according to the following rules.
+
+- Valid Payment Current Value Date: QUEUED_FOR_GENERATION
+- Valid Payment Future Value Date: ON_HOLD
+- Invalid Payment - TO BE REPAIRED</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_1atw41h" sourceRef="VerifyPaymentCutoffStatus" targetRef="TextAnnotation_15j8fis" />
+    <bpmn:textAnnotation id="TextAnnotation_0zfut1x">
+      <bpmn:text>Derive suspense account based on local charges setup</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_02lil37" sourceRef="Derive_Suspense_Account_Local_Charges" targetRef="TextAnnotation_0zfut1x" />
+    <bpmn:textAnnotation id="TextAnnotation_0d64mza">
+      <bpmn:text>When user completes this workflow task, the status should be set to DRAFT.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_18vt6um" sourceRef="IAP_ID_Claim_Payment" targetRef="TextAnnotation_0d64mza" />
+    <bpmn:textAnnotation id="TextAnnotation_0sst2wa">
+      <bpmn:text>Checker review driven by configuration???</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_1sru5eb" sourceRef="IAP_ID_CheckerPayment" targetRef="TextAnnotation_0sst2wa" />
+  </bpmn:process>
+  <bpmn:message id="Message_00vzidh" name="IAP_ID_AutomatedTrigger" />
+  <bpmn:message id="Message_0z2vtqb" name="CancelPaymentInstruction" />
+  <bpmn:message id="Message_1gi791u" name="ValueDateReached" />
+  <bpmn:message id="Message_1sme7co" name="S2BFileGenerated" />
+  <bpmn:message id="Message_0wv9miu" name="IAP_ID_BulkTrigger" />
+  <bpmn:message id="Message_IAP_ID_IDP_Trigger" name="IAP_ID_IDP_Trigger" />
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="IAP_ID_Payments">
+      <bpmndi:BPMNEdge id="Flow_0flkyeb_di" bpmnElement="Flow_0flkyeb">
+        <di:waypoint x="2160" y="505" />
+        <di:waypoint x="2160" y="630" />
+        <di:waypoint x="1790" y="630" />
+        <di:waypoint x="1790" y="520" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0e7m2ai_di" bpmnElement="Flow_0e7m2ai">
+        <di:waypoint x="440" y="258" />
+        <di:waypoint x="440" y="320" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0af90pb_di" bpmnElement="Flow_0af90pb">
+        <di:waypoint x="440" y="400" />
+        <di:waypoint x="440" y="440" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_04v6wbw_di" bpmnElement="SequenceFlow_04v6wbw">
+        <di:waypoint x="218" y="480" />
+        <di:waypoint x="260" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_1e0z7n9_di" bpmnElement="SequenceFlow_1e0z7n9">
+        <di:waypoint x="360" y="480" />
+        <di:waypoint x="390" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_0rsktes_di" bpmnElement="SequenceFlow_0rsktes">
+        <di:waypoint x="1238" y="350" />
+        <di:waypoint x="1710" y="350" />
+        <di:waypoint x="1710" y="320" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_02ontnz_di" bpmnElement="Flow_02ontnz">
+        <di:waypoint x="3360" y="160" />
+        <di:waypoint x="3360" y="450" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0uds9qs_di" bpmnElement="Flow_0uds9qs">
+        <di:waypoint x="1642" y="300" />
+        <di:waypoint x="1600" y="300" />
+        <di:waypoint x="1600" y="100" />
+        <di:waypoint x="3310" y="100" />
+        <di:waypoint x="3310" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0owiip3_di" bpmnElement="Flow_0owiip3">
+        <di:waypoint x="2630" y="440" />
+        <di:waypoint x="2630" y="160" />
+        <di:waypoint x="1690" y="160" />
+        <di:waypoint x="1690" y="240" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2634" y="317" width="52" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_18qm3su_di" bpmnElement="Flow_18qm3su">
+        <di:waypoint x="2510" y="480" />
+        <di:waypoint x="2580" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1krgnpf_di" bpmnElement="CurrentDatedTransaction">
+        <di:waypoint x="2310" y="505" />
+        <di:waypoint x="2310" y="600" />
+        <di:waypoint x="2900" y="600" />
+        <di:waypoint x="2900" y="540" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2276" y="541" width="89" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_067megy_di" bpmnElement="Flow_067megy">
+        <di:waypoint x="2920" y="490" />
+        <di:waypoint x="2972" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0rs5o3k_di" bpmnElement="Flow_0rs5o3k">
+        <di:waypoint x="2698" y="520" />
+        <di:waypoint x="2820" y="520" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0n8jlgq_di" bpmnElement="FutureDatedTransaction">
+        <di:waypoint x="2335" y="480" />
+        <di:waypoint x="2410" y="480" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2326" y="483" width="90" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_14lgqp5_di" bpmnElement="ToBeRepaired">
+        <di:waypoint x="1650" y="455" />
+        <di:waypoint x="1650" y="388" />
+        <di:waypoint x="1730" y="388" />
+        <di:waypoint x="1730" y="320" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1631" y="405" width="70" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0gegodc_di" bpmnElement="RepairFree">
+        <di:waypoint x="1675" y="480" />
+        <di:waypoint x="1740" y="480" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1680" y="462" width="56" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Oukufw2_di" bpmnElement="Flow_Oukufw2">
+        <di:waypoint x="3410" y="490" />
+        <di:waypoint x="3492" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1fzrdou_di" bpmnElement="Flow_1fzrdou">
+        <di:waypoint x="3190" y="490" />
+        <di:waypoint x="3310" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1riju20_di" bpmnElement="Flow_1riju20">
+        <di:waypoint x="3008" y="490" />
+        <di:waypoint x="3090" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1mix3re_di" bpmnElement="ReworkPayment">
+        <di:waypoint x="2160" y="455" />
+        <di:waypoint x="2160" y="190" />
+        <di:waypoint x="1710" y="190" />
+        <di:waypoint x="1710" y="240" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2099" y="341" width="81" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_04aob20_di" bpmnElement="Flow_04aob20">
+        <di:waypoint x="1760" y="280" />
+        <di:waypoint x="1790" y="280" />
+        <di:waypoint x="1790" y="440" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1799" y="256" width="81" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_01utti5_di" bpmnElement="Flow_01utti5">
+        <di:waypoint x="490" y="480" />
+        <di:waypoint x="560" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0d5f5n5_di" bpmnElement="Flow_0d5f5n5">
+        <di:waypoint x="840" y="480" />
+        <di:waypoint x="900" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1cdnr67_di" bpmnElement="Flow_1cdnr67">
+        <di:waypoint x="1190" y="480" />
+        <di:waypoint x="1270" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0d2veoc_di" bpmnElement="Flow_0d2veoc">
+        <di:waypoint x="1000" y="480" />
+        <di:waypoint x="1090" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1if6k56_di" bpmnElement="Flow_1if6k56">
+        <di:waypoint x="660" y="480" />
+        <di:waypoint x="740" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0f7rzgr_di" bpmnElement="ProceedWithPayment">
+        <di:waypoint x="2185" y="480" />
+        <di:waypoint x="2285" y="480" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2194" y="462" width="83" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1dp2ke5_di" bpmnElement="Flow_1dp2ke5">
+        <di:waypoint x="2090" y="480" />
+        <di:waypoint x="2135" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1mr4lgw_di" bpmnElement="PaymentApproved">
+        <di:waypoint x="1945" y="480" />
+        <di:waypoint x="1990" y="480" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1925" y="436" width="85" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0vyfcqo_di" bpmnElement="ReworkPaymentRequest">
+        <di:waypoint x="1920" y="455" />
+        <di:waypoint x="1920" y="220" />
+        <di:waypoint x="1730" y="220" />
+        <di:waypoint x="1730" y="240" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1895" y="335" width="90" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0axaqhk_di" bpmnElement="Flow_0axaqhk">
+        <di:waypoint x="1840" y="480" />
+        <di:waypoint x="1895" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_12eshdy_di" bpmnElement="Flow_12eshdy">
+        <di:waypoint x="1550" y="480" />
+        <di:waypoint x="1625" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0v2bji8_di" bpmnElement="Flow_0v2bji8">
+        <di:waypoint x="1370" y="480" />
+        <di:waypoint x="1450" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_12mndij_di" bpmnElement="Flow_12mndij">
+        <di:waypoint x="1650" y="505" />
+        <di:waypoint x="1650" y="640" />
+        <di:waypoint x="1920" y="640" />
+        <di:waypoint x="1920" y="505" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="Event_1onn836_di" bpmnElement="IAP_ID_AutomatedTrigger">
+        <dc:Bounds x="182" y="462" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="156" y="505" width="89" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_03jtr5m_di" bpmnElement="IAP_ID_CheckerPayment" bioc:stroke="rgb(251, 140, 0)" bioc:fill="rgb(255, 224, 178)">
+        <dc:Bounds x="1740" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_00bp4ef_di" bpmnElement="CheckerApprovalGateway" isMarkerVisible="true">
+        <dc:Bounds x="1895" y="455" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1879" y="512" width="83" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1pk1skr_di" bpmnElement="IAP_ID_MakerPayment" bioc:stroke="rgb(251, 140, 0)" bioc:fill="rgb(255, 224, 178)">
+        <dc:Bounds x="1660" y="240" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_15l54rw_di" bpmnElement="Derive_Client_from_AccountNumber" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="1270" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_09baxuu_di" bpmnElement="Save_Payment_Transaction" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="1450" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1vqeewi_di" bpmnElement="VerifyPaymentCutoffStatus" bioc:stroke="rgb(251, 140, 0)" bioc:fill="rgb(255, 224, 178)">
+        <dc:Bounds x="1990" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_0sy4ejo_di" bpmnElement="PaymentCheckGateway" isMarkerVisible="true">
+        <dc:Bounds x="2135" y="455" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2188" y="538" width="84" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_1r113m4_di" bpmnElement="FutureDateValidationGateway" isMarkerVisible="true">
+        <dc:Bounds x="2285" y="455" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2308" y="436" width="85" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_0t03wgv_di" bpmnElement="IAP_ID_Claim_Payment" bioc:stroke="rgb(251, 140, 0)" bioc:fill="rgb(255, 224, 178)">
+        <dc:Bounds x="2580" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_11timqv_di" bpmnElement="OTT_Payment_Mode_Value_Date" bioc:stroke="rgb(251, 140, 0)" bioc:fill="rgb(255, 224, 178)">
+        <dc:Bounds x="560" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1eahk3p_di" bpmnElement="Derive_Suspense_Account_Local_Charges" bioc:stroke="rgb(251, 140, 0)" bioc:fill="rgb(255, 224, 178)">
+        <dc:Bounds x="740" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1ccvqba_di" bpmnElement="Enrich_Internal_Account_Details" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="900" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_0yo6046_di" bpmnElement="Enrich_External_Account_Details" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="1090" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_1c15k4d_di" bpmnElement="Event_1c15k4d">
+        <dc:Bounds x="3492" y="472" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="3500" y="515" width="20" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1fqu22n_di" bpmnElement="PaymentStatusToComplete" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="3090" y="450" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1vhvtta_di" bpmnElement="PublishPaymentStatusAndSSTMFeedback" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="3310" y="450" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_1kpxhe0_di" bpmnElement="PaymentValidationGateway" isMarkerVisible="true">
+        <dc:Bounds x="1625" y="455" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1611" y="512" width="79" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1r1z16s_di" bpmnElement="QueueForPaymentGeneration" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="2820" y="460" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_1lvmiqn_di" bpmnElement="Event_0kavmph">
+        <dc:Bounds x="2972" y="472" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2953" y="518" width="73" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_160a549_di" bpmnElement="Payment_Status_OnHold" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="2410" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1orzrbr_di" bpmnElement="Initialize_IAP_ID_Payments" bioc:stroke="rgb(251, 140, 0)" bioc:fill="rgb(255, 224, 178)">
+        <dc:Bounds x="390" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_10xvmhs_di" bpmnElement="PaymentCancellation" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="3310" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_12sy70i_di" bpmnElement="IAP_ID_Manual_Payment">
+        <dc:Bounds x="1202" y="332" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1178" y="295" width="84" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ServiceTask_0i4cx3i_di" bpmnElement="Initialize_IAP_Payments" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="260" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1nu2p9j_di" bpmnElement="Initialize_IAP_Bulk_Payments" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="390" y="320" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_1ulbdoj_di" bpmnElement="IAP_ID_BulkTrigger">
+        <dc:Bounds x="422" y="222" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="396" y="185" width="88" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_1990p51_di" bpmnElement="TextAnnotation_1990p51">
+        <dc:Bounds x="1310" y="580" width="250" height="68" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_14ch0ki_di" bpmnElement="TextAnnotation_14ch0ki">
+        <dc:Bounds x="440" y="610" width="120" height="65" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_1t5s6kk_di" bpmnElement="TextAnnotation_1t5s6kk">
+        <dc:Bounds x="560" y="640" width="140" height="208" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_15j8fis_di" bpmnElement="TextAnnotation_15j8fis">
+        <dc:Bounds x="1950" y="696" width="380" height="96" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_0zfut1x_di" bpmnElement="TextAnnotation_0zfut1x">
+        <dc:Bounds x="700" y="620" width="100" height="82" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_0d64mza_di" bpmnElement="TextAnnotation_0d64mza">
+        <dc:Bounds x="2815" y="270" width="170" height="54" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_0sst2wa_di" bpmnElement="TextAnnotation_0sst2wa">
+        <dc:Bounds x="1650" y="780" width="240" height="40" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_02xggni_di" bpmnElement="CancelPaymentInstruction">
+        <dc:Bounds x="1642" y="282" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1597" y="323" width="87" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_17e23v4_di" bpmnElement="ValueDateReached">
+        <dc:Bounds x="2662" y="502" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2670" y="538" width="82" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_1bpxnqd_di" bpmnElement="Association_1bpxnqd">
+        <di:waypoint x="1470" y="520" />
+        <di:waypoint x="1435" y="566" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_1kx13c6_di" bpmnElement="Association_1kx13c6">
+        <di:waypoint x="451" y="520" />
+        <di:waypoint x="475" y="610" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_08dnw4l_di" bpmnElement="Association_08dnw4l">
+        <di:waypoint x="603" y="520" />
+        <di:waypoint x="586" y="640" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_1atw41h_di" bpmnElement="Association_1atw41h">
+        <di:waypoint x="2055" y="520" />
+        <di:waypoint x="2122" y="696" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_02lil37_di" bpmnElement="Association_02lil37">
+        <di:waypoint x="780" y="520" />
+        <di:waypoint x="755" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_18vt6um_di" bpmnElement="Association_18vt6um">
+        <di:waypoint x="2678" y="445" />
+        <di:waypoint x="2844" y="324" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_1sru5eb_di" bpmnElement="Association_1sru5eb">
+        <di:waypoint x="1787" y="520" />
+        <di:waypoint x="1770" y="732" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Trigger_Init_di" bpmnElement="Flow_IDP_Trigger_Init">
+        <di:waypoint x="218" y="338" />
+        <di:waypoint x="260" y="338" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_To_IAP_ID_Init_di" bpmnElement="Flow_IDP_To_IAP_ID_Init">
+        <di:waypoint x="360" y="338" />
+        <di:waypoint x="390" y="338" />
+        <di:waypoint x="390" y="440" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="IAP_ID_IDP_Trigger_di" bpmnElement="IAP_ID_IDP_Trigger">
+        <dc:Bounds x="182" y="320" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="156" y="363" width="89" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Initialize_IAP_From_IDP_di" bpmnElement="Initialize_IAP_From_IDP" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="260" y="298" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_IDP_IDP_Trigger_di" bpmnElement="TextAnnotation_IDP_IDP_Trigger">
+        <dc:Bounds x="100" y="250" width="200" height="68" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Initialize_IAP_From_IDP_di" bpmnElement="TextAnnotation_Initialize_IAP_From_IDP">
+        <dc:Bounds x="250" y="200" width="200" height="68" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_IDP_IDP_Trigger_di" bpmnElement="Association_IDP_IDP_Trigger">
+        <di:waypoint x="200" y="320" />
+        <di:waypoint x="200" y="282" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Initialize_IAP_From_IDP_di" bpmnElement="Association_Initialize_IAP_From_IDP">
+        <di:waypoint x="310" y="298" />
+        <di:waypoint x="310" y="268" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
