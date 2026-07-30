@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:bioc="http://bpmn.io/schema/bpmn/biocolor/1.0" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="Definitions_IDP_Document_Ingestion" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="4.6.0">
+  <bpmn:process id="IDP_Document_Ingestion" name="IDP_Document_Ingestion" isExecutable="true" camunda:historyTimeToLive="10000">
+    <bpmn:startEvent id="IDP_Upload_Start" name="IDP Upload Start">
+      <bpmn:outgoing>Flow_IDP_Start_Store</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_IDP_Start_Store" sourceRef="IDP_Upload_Start" targetRef="Store_IDP_Document" />
+    <bpmn:serviceTask id="Store_IDP_Document" name="Store IDP Document" camunda:type="external" camunda:topic="Store_IDP_Document">
+      <bpmn:incoming>Flow_IDP_Start_Store</bpmn:incoming>
+      <bpmn:outgoing>Flow_IDP_Store_Extract</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_IDP_Store_Extract" sourceRef="Store_IDP_Document" targetRef="Trigger_IDP_Extraction" />
+    <bpmn:serviceTask id="Trigger_IDP_Extraction" name="Trigger IDP Extraction" camunda:type="external" camunda:topic="Trigger_IDP_Extraction">
+      <bpmn:incoming>Flow_IDP_Store_Extract</bpmn:incoming>
+      <bpmn:outgoing>Flow_IDP_Extract_Wait</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_IDP_Extract_Wait" sourceRef="Trigger_IDP_Extraction" targetRef="Event_IDPExtractionCompleted" />
+    <bpmn:intermediateCatchEvent id="Event_IDPExtractionCompleted" name="IDP Extraction Completed">
+      <bpmn:incoming>Flow_IDP_Extract_Wait</bpmn:incoming>
+      <bpmn:outgoing>Flow_IDP_Wait_Gateway</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_IDPExtractionCompleted" messageRef="Message_IDPExtractionCompleted" />
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="Flow_IDP_Wait_Gateway" sourceRef="Event_IDPExtractionCompleted" targetRef="IDPExtractionGateway" />
+    <bpmn:exclusiveGateway id="IDPExtractionGateway" name="IDPExtractionGateway" default="Flow_IDP_Extract_Fail">
+      <bpmn:incoming>Flow_IDP_Wait_Gateway</bpmn:incoming>
+      <bpmn:outgoing>Flow_IDP_Extract_Success</bpmn:outgoing>
+      <bpmn:outgoing>Flow_IDP_Extract_Fail</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="Flow_IDP_Extract_Success" name="ExtractionSuccess" sourceRef="IDPExtractionGateway" targetRef="IDP_MakerReview">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${idpStatus=='READY_FOR_REVIEW'}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_IDP_Extract_Fail" name="ExtractionFailed" sourceRef="IDPExtractionGateway" targetRef="Event_IDP_Failed_End" />
+    <bpmn:userTask id="IDP_MakerReview" name="IDP_MakerReview" camunda:assignee="${paymentMaker}">
+      <bpmn:incoming>Flow_IDP_Extract_Success</bpmn:incoming>
+      <bpmn:incoming>Flow_IDP_Checker_Reject</bpmn:incoming>
+      <bpmn:outgoing>Flow_IDP_Maker_Checker</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="Flow_IDP_Maker_Checker" sourceRef="IDP_MakerReview" targetRef="IDP_CheckerReview" />
+    <bpmn:userTask id="IDP_CheckerReview" name="IDP_CheckerReview" camunda:assignee="${paymentChecker}">
+      <bpmn:documentation>${lastUpdatedUser}</bpmn:documentation>
+      <bpmn:incoming>Flow_IDP_Maker_Checker</bpmn:incoming>
+      <bpmn:outgoing>Flow_IDP_Checker_Gateway</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="Flow_IDP_Checker_Gateway" sourceRef="IDP_CheckerReview" targetRef="IDPCheckerGateway" />
+    <bpmn:exclusiveGateway id="IDPCheckerGateway" name="IDPCheckerGateway" default="Flow_IDP_Checker_Reject">
+      <bpmn:incoming>Flow_IDP_Checker_Gateway</bpmn:incoming>
+      <bpmn:outgoing>Flow_IDP_Checker_Approve</bpmn:outgoing>
+      <bpmn:outgoing>Flow_IDP_Checker_Reject</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="Flow_IDP_Checker_Approve" name="CheckerApproved" sourceRef="IDPCheckerGateway" targetRef="Trigger_IDP_Payment">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${idpApproved==true}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_IDP_Checker_Reject" name="CheckerRejected" sourceRef="IDPCheckerGateway" targetRef="IDP_MakerReview">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${idpApproved==false}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:serviceTask id="Trigger_IDP_Payment" name="Trigger IDP Payment" camunda:type="external" camunda:topic="Trigger_IDP_Payment">
+      <bpmn:incoming>Flow_IDP_Checker_Approve</bpmn:incoming>
+      <bpmn:outgoing>Flow_IDP_Trigger_End</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_IDP_Trigger_End" sourceRef="Trigger_IDP_Payment" targetRef="Event_IDP_End" />
+    <bpmn:endEvent id="Event_IDP_End" name="End">
+      <bpmn:incoming>Flow_IDP_Trigger_End</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="Event_IDP_Failed_End" name="Extraction Failed">
+      <bpmn:incoming>Flow_IDP_Extract_Fail</bpmn:incoming>
+      <bpmn:incoming>Flow_IDP_Cancel_End</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:boundaryEvent id="CancelIDPUpload" name="CancelIDPUpload" attachedToRef="IDP_MakerReview">
+      <bpmn:outgoing>Flow_IDP_Cancel_End</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_CancelIDPUpload" messageRef="Message_CancelIDPUpload" />
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_IDP_Cancel_End" sourceRef="CancelIDPUpload" targetRef="Event_IDP_Failed_End" />
+    <bpmn:boundaryEvent id="IDPExtractionFailed" name="IDPExtractionFailed" attachedToRef="Event_IDPExtractionCompleted">
+      <bpmn:outgoing>Flow_IDP_Boundary_Fail</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_IDPExtractionFailed" messageRef="Message_IDPExtractionFailed" />
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_IDP_Boundary_Fail" sourceRef="IDPExtractionFailed" targetRef="Event_IDP_Failed_End" />
+    <bpmn:textAnnotation id="TextAnnotation_IDP_Trigger_Payment">
+      <bpmn:text>Correlates country-specific payment message (e.g. IAP_ID_IDP_Trigger) via Trigger_IDP_Payment handler and IDPPaymentRouteRegistry</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_IDP_Trigger_Payment" sourceRef="Trigger_IDP_Payment" targetRef="TextAnnotation_IDP_Trigger_Payment" />
+    <bpmn:textAnnotation id="TextAnnotation_IDP_Common">
+      <bpmn:text>Common IDP process for all countries. Upload REST starts this process — not IAP_ID_Manual_Payment or country payment processes.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_IDP_Common" sourceRef="IDP_Upload_Start" targetRef="TextAnnotation_IDP_Common" />
+  </bpmn:process>
+  <bpmn:message id="Message_IDPExtractionCompleted" name="IDPExtractionCompleted" />
+  <bpmn:message id="Message_IDPExtractionFailed" name="IDPExtractionFailed" />
+  <bpmn:message id="Message_CancelIDPUpload" name="CancelIDPUpload" />
+  <bpmndi:BPMNDiagram id="BPMNDiagram_IDP">
+    <bpmndi:BPMNPlane id="BPMNPlane_IDP" bpmnElement="IDP_Document_Ingestion">
+      <bpmndi:BPMNEdge id="Flow_IDP_Start_Store_di" bpmnElement="Flow_IDP_Start_Store">
+        <di:waypoint x="188" y="200" />
+        <di:waypoint x="240" y="200" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Store_Extract_di" bpmnElement="Flow_IDP_Store_Extract">
+        <di:waypoint x="340" y="200" />
+        <di:waypoint x="400" y="200" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Extract_Wait_di" bpmnElement="Flow_IDP_Extract_Wait">
+        <di:waypoint x="500" y="200" />
+        <di:waypoint x="562" y="200" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Wait_Gateway_di" bpmnElement="Flow_IDP_Wait_Gateway">
+        <di:waypoint x="598" y="200" />
+        <di:waypoint x="655" y="200" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Extract_Success_di" bpmnElement="Flow_IDP_Extract_Success">
+        <di:waypoint x="705" y="200" />
+        <di:waypoint x="760" y="200" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="710" y="182" width="55" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Extract_Fail_di" bpmnElement="Flow_IDP_Extract_Fail">
+        <di:waypoint x="680" y="225" />
+        <di:waypoint x="680" y="320" />
+        <di:waypoint x="900" y="320" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="688" y="248" width="55" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Maker_Checker_di" bpmnElement="Flow_IDP_Maker_Checker">
+        <di:waypoint x="860" y="200" />
+        <di:waypoint x="920" y="200" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Checker_Gateway_di" bpmnElement="Flow_IDP_Checker_Gateway">
+        <di:waypoint x="1020" y="200" />
+        <di:waypoint x="1075" y="200" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Checker_Approve_di" bpmnElement="Flow_IDP_Checker_Approve">
+        <di:waypoint x="1125" y="200" />
+        <di:waypoint x="1180" y="200" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1128" y="182" width="55" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Checker_Reject_di" bpmnElement="Flow_IDP_Checker_Reject">
+        <di:waypoint x="1100" y="225" />
+        <di:waypoint x="1100" y="100" />
+        <di:waypoint x="810" y="100" />
+        <di:waypoint x="810" y="160" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1093" y="133" width="55" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Trigger_End_di" bpmnElement="Flow_IDP_Trigger_End">
+        <di:waypoint x="1280" y="200" />
+        <di:waypoint x="1342" y="200" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Cancel_End_di" bpmnElement="Flow_IDP_Cancel_End">
+        <di:waypoint x="810" y="258" />
+        <di:waypoint x="810" y="320" />
+        <di:waypoint x="900" y="320" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_IDP_Boundary_Fail_di" bpmnElement="Flow_IDP_Boundary_Fail">
+        <di:waypoint x="598" y="238" />
+        <di:waypoint x="598" y="320" />
+        <di:waypoint x="900" y="320" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="IDP_Upload_Start_di" bpmnElement="IDP_Upload_Start">
+        <dc:Bounds x="152" y="182" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="128" y="155" width="55" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Store_IDP_Document_di" bpmnElement="Store_IDP_Document" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="240" y="160" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Trigger_IDP_Extraction_di" bpmnElement="Trigger_IDP_Extraction" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="400" y="160" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_IDPExtractionCompleted_di" bpmnElement="Event_IDPExtractionCompleted">
+        <dc:Bounds x="562" y="182" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="538" y="155" width="55" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="IDPExtractionGateway_di" bpmnElement="IDPExtractionGateway" isMarkerVisible="true">
+        <dc:Bounds x="655" y="175" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="636" y="145" width="89" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="IDP_MakerReview_di" bpmnElement="IDP_MakerReview" bioc:stroke="rgb(251, 140, 0)" bioc:fill="rgb(255, 224, 178)">
+        <dc:Bounds x="760" y="160" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="IDP_CheckerReview_di" bpmnElement="IDP_CheckerReview" bioc:stroke="rgb(251, 140, 0)" bioc:fill="rgb(255, 224, 178)">
+        <dc:Bounds x="920" y="160" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="IDPCheckerGateway_di" bpmnElement="IDPCheckerGateway" isMarkerVisible="true">
+        <dc:Bounds x="1075" y="175" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1058" y="145" width="84" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Trigger_IDP_Payment_di" bpmnElement="Trigger_IDP_Payment" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="1180" y="160" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_IDP_End_di" bpmnElement="Event_IDP_End">
+        <dc:Bounds x="1342" y="182" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1350" y="155" width="20" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_IDP_Failed_End_di" bpmnElement="Event_IDP_Failed_End">
+        <dc:Bounds x="900" y="302" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="876" y="345" width="55" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="CancelIDPUpload_di" bpmnElement="CancelIDPUpload">
+        <dc:Bounds x="792" y="242" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="768" y="285" width="55" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="IDPExtractionFailed_di" bpmnElement="IDPExtractionFailed">
+        <dc:Bounds x="580" y="222" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="556" y="265" width="55" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_IDP_Trigger_Payment_di" bpmnElement="TextAnnotation_IDP_Trigger_Payment">
+        <dc:Bounds x="1160" y="60" width="200" height="68" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_IDP_Common_di" bpmnElement="TextAnnotation_IDP_Common">
+        <dc:Bounds x="140" y="60" width="200" height="68" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_IDP_Trigger_Payment_di" bpmnElement="Association_IDP_Trigger_Payment">
+        <di:waypoint x="1230" y="160" />
+        <di:waypoint x="1230" y="128" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_IDP_Common_di" bpmnElement="Association_IDP_Common">
+        <di:waypoint x="170" y="182" />
+        <di:waypoint x="170" y="128" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
