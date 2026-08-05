@@ -1,142 +1,135 @@
-# IDP Document Ingestion — API Reference
+# ESS Payments Document Ingestion - API Reference
+> **Status:** Final v7 — entity-only routing (aligned with [IDP_LLD.md §4](./IDP_LLD.md#4-entity-routing--template-config)); gateway façade for maker/checker
+> **Created:** 2026-08-02 · **Corrected:** 2026-08-03 (v2) · 2026-08-03 (v3) · 2026-08-03 (v4) · 2026-08-04 (v6/v7)
+> **Related:** [README.md](./README.md) · [IDP_LLD.md §9](./IDP_LLD.md#9-code-implementation-strategy) · [IDP_UX_Design.md §8](./IDP_UX_Design.md) · [ESS_Payments_Document_Ingestion.bpmn](./ESS_Payments_Document_Ingestion.bpmn) · [../51786-idp-extraction-service/extraction-main](../51786-idp-extraction-service/extraction-main) · [../51786-workflow-management/src/main/java/com/sc/fss/iap/workflow/controller/WorkflowServicesController.java](../51786-workflow-management/src/main/java/com/sc/fss/iap/workflow/controller/WorkflowServicesController.java)
 
-> **Status:** Final  
-> **Created:** 2026-08-02  
-> **Related:** [README.md](./README.md) · [IDP_LLD.md](./IDP_LLD.md) §6 · [IDP_UX_Design.md](./IDP_UX_Design.md) §8.5 · [../51786-idp-extraction-service/README.md](../51786-idp-extraction-service/README.md)
-
-This document lists **all APIs** in the IDP document upload flow: what each endpoint does, who calls it, and how it fits the end-to-end journey.
+This document lists **all APIs** in the document ingestion & extraction upload flow: what each endpoint does, who calls it, and how it fits the end-to-end journey. Extraction service endpoints are **already built**; gateway upload/action endpoints are **planned**; workflow-management task APIs are **existing** but invoked **server-side by the gateway** for maker/checker actions (portal must not call them directly — see [§3](#3-maker-checker-action-apis--gateway-facade-required)).
 
 ---
-
 ## 1. API landscape
+| Service | Base path (incl. servlet context path) | Caller | Status |
+|---|---|---|---|
+| `51786-payment-gateway-service` | `/api/fss/payments/gateway/v1/extraction-uploads` | Portal UI (makers/checkers) — upload, list, detail, **and all maker/checker actions** | **Planned** (new) |
+| `51786-payment-gateway-service` | `/api/fss/payments/gateway/v1/extraction-uploads/internal` | `51786-idp-extraction-service`, ops | **Planned** (new, internal network only) |
+| `51786-workflow-management` | `/api/fss/payments/workflow/v1/set`, `/v1/complete`, `/v1/assign` | **payment-gateway-service only** (server-side `WorkflowService` client) — **not** portal UI for this feature | **Existing, reused server-side** |
+| `51786-idp-extraction-service` | `/v1/extract` | `payment-gateway-service` | **Built** |
 
-Two services expose HTTP APIs. The portal talks only to **payment-gateway-service**. The gateway orchestrates Camunda and calls **idp-extraction-service** internally.
+> **v7 correction — entity-only routing.** `country` and `entity` are the same concept; use **`entity` only** on upload APIs, DB (`fss_payment_upload_meta.entity`), Camunda process variable, and registry lookup. Phase 1: `entity=ID` (Indonesia). If the built extraction service metadata map still expects a `country` key, `ExtractionServiceClient` maps `entity` → `country` at the HTTP boundary only — see [LLD §4](./IDP_LLD.md#4-entity-routing--template-config).
 
-| Service | Base path | Caller | Status |
-|---------|-----------|--------|--------|
-| `51786-payment-gateway-service` | `/v1/idp` | Portal UI (makers/checkers) | **Planned** |
-| `51786-payment-gateway-service` | `/v1/workflow` | Portal UI (human tasks) | **Existing** — reused for IDP tasks |
-| `51786-payment-gateway-service` | `/v1/idp/internal` | idp-extraction-service, ops | **Planned** (internal network only) |
-| `51786-idp-extraction-service` | `/v1/extract` | payment-gateway-service | **Built** |
+> **v6 correction — gateway façade for maker/checker actions.** Submit, Cancel, Approve, and Reject must call `POST .../submit|cancel|approve|reject` on **payment-gateway-service**. The gateway updates `fss_payment_upload_meta`, `fss_payment_data_ingest_details`, and `fss_payment_upload_audit`, then calls the existing `setTaskDetails` + `completeCurrentTask` contract **server-side**. Direct UI → workflow-management leaves gateway tables stale even when Camunda advances.
+
+> **v4 correction - BPMN redesign removes the need for a new message-correlation endpoint.** In `ESS_Payments_Document_Ingestion.bpmn` (process id `ESS_Payments_Document_Ingestion`), `Event_ExtractionCompleted`, `ExtractionFailedBoundary`, and the message form of `CancelExtractionUpload` were removed. Extraction result is now a plain gateway decision evaluated the instant `Trigger_Data_Extraction` completes, and Cancel is now a plain gateway decision (`MakerDecisionGateway`) evaluated the instant `Extraction_MakerReview` completes. **The `/v1/correlate/correlateMessage` endpoint proposed in v3 §3.4 is no longer needed** - Cancel now uses the same two-call WFM pattern, but **only from the gateway** after DB + audit updates. See [README §Naming change (v3)](./README.md#naming-change-v3).
+
+> **v3 correction (still valid) - base paths and naming verified against real source.** `payment-gateway-service` has **no** global `server.servlet.context-path`; every controller hardcodes its own full path in `@RequestMapping` (confirmed in `PaymentController`, `PaymentsEnrichmentController`, `BulkUploadController`, `SummaryController`, `TransactionDetailController`), always following `/api/fss/payments/{module}/v{n}/...`. None of those controllers use REST path variables for ids - lookups are always `@RequestParam` query parameters, and sub-actions are camelCase verb paths (`getByDTO`, `getUploadsByDTO`, `retry`, `getMessage/inbound`); `@PatchMapping` is never used in this service. `workflow-management`, by contrast, **does** set `server.servlet.context-path=/api/fss/payments/workflow` in `application.properties`, on top of which `WorkflowServicesController` adds `@RequestMapping("v1")` - every call in §3 needs that `/api/fss/payments/workflow` prefix. `51786-idp-extraction-service` sets no context path; `ExtractionController` maps directly to `/v1/extract`.
 
 ```mermaid
 sequenceDiagram
     participant UI as Portal
-    participant GW as payment-gateway
-    participant WFM as Camunda
-    participant EXT as idp-extraction-service
-
-    UI->>GW: POST /v1/idp/uploads
-    GW->>WFM: startWorkflow(IDP_Document_Ingestion)
-    WFM->>GW: External task Trigger_IDP_Extraction
+    participant GW as payment-gateway-service
+    participant WFM as workflow-management
+    participant EXT as 51786-idp-extraction-service
+    UI->>GW: POST /api/fss/payments/gateway/v1/extraction-uploads
+    GW->>WFM: POST /api/fss/payments/workflow/v1/start/startWorkflowProcess?processKey=ESS_Payments_Document_Ingestion
+    WFM->>GW: External task Trigger_Data_Extraction
     GW->>EXT: POST /v1/extract (sync)
-    EXT-->>GW: structured JSON
-    GW->>WFM: correlate IDPExtractionCompleted
-    UI->>GW: GET /v1/idp/uploads/{id}
-    UI->>GW: PATCH /v1/idp/uploads/{id}/fields
-    UI->>GW: POST /v1/workflow/complete (maker submit)
-    UI->>GW: POST /v1/workflow/complete (checker approve)
-    WFM->>GW: External task Trigger_IDP_Payment
-    GW->>WFM: startMessageCorrelation (registry)
+    EXT-->>GW: 200 structuredOutput OR 422 status=FAILED
+    GW->>WFM: complete Trigger_Data_Extraction with extractionStatus (ExtractionResultGateway evaluates immediately)
+    UI->>GW: GET /api/fss/payments/gateway/v1/extraction-uploads/getDetail?extractionUploadId={id}
+    UI->>GW: POST /api/fss/payments/gateway/v1/extraction-uploads/fields?extractionUploadId={id}
+    UI->>GW: POST .../submit|cancel|approve|reject?uploadId={id}
+    GW->>GW: Validate role + status; INSERT audit; UPDATE meta/details status
+    GW->>WFM: setTaskDetails + completeCurrentTask (server-side WorkflowService client)
+    WFM->>GW: External task Trigger_Payment_From_Extraction (on approve only)
+    GW->>WFM: startMessageCorrelation (registry-resolved message, cross-process handoff to IAP_ID_Payments only)
 ```
 
 ---
 
-## 2. Portal APIs — `payment-gateway-service`
+## 2. Portal upload APIs - `payment-gateway-service`
 
-**Base path:** `/v1/idp`  
-**Auth:** Existing portal JWT. Role groups: `paymentMaker`, `paymentChecker`.
+**Base path:** `/api/fss/payments/gateway/v1/extraction-uploads` (hardcoded in the new controller's `@RequestMapping`, matching every sibling controller in this service - there is no `server.servlet.context-path` here).
+**Auth:** existing portal JWT. Role groups: `paymentMaker`, `paymentChecker` (same groups already configured for `IAP ID Payments`).
 
 ### 2.1 Summary table
 
-| Method | Path | Purpose | UI use |
-|--------|------|---------|--------|
-| `POST` | `/uploads` | Upload file + metadata; persist rows; start `IDP_Document_Ingestion` | Upload button |
-| `GET` | `/uploads` | List uploads (recent first, filters) | Upload tab table |
-| `GET` | `/uploads/{id}` | Upload detail + latest extraction run + fields (no blob) | Detail modal |
-| `PATCH` | `/uploads/{id}/fields` | Maker saves draft field edits | Save draft |
-| `POST` | `/uploads/{id}/re-extract` | Start new extraction run | Re-extract button |
-| `POST` | `/workflow/complete` | Complete Camunda user task | Submit / Approve / Reject / Cancel |
+| Method | Path (relative to `/api/fss/payments/gateway/v1/extraction-uploads`) | Purpose | UI use |
+| --- | --- | --- | --- |
+| `POST` | *(bare)* | Upload PDF or ZIP (+ metadata); persist row(s); start `ESS_Payments_Document_Ingestion` per PDF | Upload button |
+| `GET` | `/getUploads` | List uploads (recent first, filters) | Upload tab table |
+| `GET` | `/getDetail?extractionUploadId={id}` | Upload detail + latest extraction run + fields (no blob) | Detail modal |
+| `POST` | `/fields?uploadId={id}&detailId={detailId}` | Maker saves draft field edits (one instruction) | Save draft |
+| `POST` | `/re-extract?uploadId={id}` | Start a new extraction run | Re-extract button |
+| `POST` | `/performAction?uploadId={id}` | Maker/checker action — body `{ "action": "SUBMIT"\|"CANCEL"\|"APPROVE"\|"REJECT", "remarks": "..." }` — **preferred** unified endpoint (see [LLD §9.4](./IDP_LLD.md#94-extractionuploadactionservice--single-entry-switch-inside-service)) |
+| `POST` | `/submit?uploadId={id}` | Maker submit (alias of `performAction`) | Submit to checker |
+| `POST` | `/cancel?uploadId={id}` | Maker cancel (alias) | Cancel upload |
+| `POST` | `/approve?uploadId={id}` | Checker approve (alias) | Approve |
+| `POST` | `/reject?uploadId={id}` | Checker reject (alias) | Reject |
 
----
+This mirrors the exact style already used in this service: bare `POST` for the primary create action (as in `BulkUploadController`'s bare `@PostMapping`), camelCase `get*` sub-paths for lookups (as in `getUploadsByDTO`/`getByDTO`), ids passed as `@RequestParam` query parameters rather than `{id}` path variables (as in `retryTransaction(@RequestParam String transactionId, ...)`), and `POST` - never `@PatchMapping`, which is not used anywhere in this service - for the mutating "edit" call.
 
-### 2.2 `POST /v1/idp/uploads`
+**Maker/checker actions** must go through the gateway (`POST .../performAction` preferred, or `/submit`, `/cancel`, `/approve`, `/reject`) — **not** `workflow-management` directly. See [§3](#3-maker-checker-action-apis--gateway-facade-required).
 
-Upload a payment instruction document and start the IDP workflow.
+### 2.2 `POST /api/fss/payments/gateway/v1/extraction-uploads`
 
 **Content-Type:** `multipart/form-data`
 
 | Part | Type | Required | Description |
-|------|------|----------|-------------|
-| `file` | file | Yes | PDF or image |
-| `country` | string | Yes | Route key — phase 1: `ID` |
-| `entity` | string | No | Legal/booking entity when distinct from country |
+| --- | --- | --- | --- |
+| `file` | file | Yes | Single **PDF** (`.pdf`) **or ZIP** (`.zip`) containing one or more PDFs. ZIP: only `.pdf` entries are processed; all other members are ignored. ZIP with zero PDFs → `400`. |
+| `entity` | string | Yes | **Routing key** — selects payment BPMN + LLM template; phase 1: `ID` |
 | `deptId` | string | Yes | Department metadata |
 | `processId` | string | Yes | Process metadata |
 | `subProcessId` | string | No | Sub-process metadata |
 | `activityId` | string | No | Activity metadata |
 | `subActivityId` | string | No | Sub-activity metadata |
 
-**Alternative:** metadata as JSON part `metadata` (same fields as below).
+**Server actions (single PDF):**
 
-**Example metadata (JSON part):**
+1. Insert `fss_payment_upload_content` + `fss_payment_upload_meta` (`status=UPLOADED` → `PROCESSING`).
+2. `POST {workflow-management}/v1/start/startWorkflowProcess?processKey=ESS_Payments_Document_Ingestion&referenceId={uploadId}` with process variable `entity`.
+3. On extraction complete: one `fss_payment_data_ingest_details` row per `initiationDetail` instruction.
 
-```json
-{
-  "country": "ID",
-  "entity": null,
-  "deptId": "FundServices",
-  "processId": "Cash",
-  "subProcessId": "CI",
-  "activityId": "BT",
-  "subActivityId": "Redemption"
-}
-```
+**Server actions (ZIP bulk):**
 
-**Server actions:**
+1. Generate `batchId` (UUID).
+2. Unpack ZIP; for each `.pdf` entry (case-insensitive): same steps as single PDF, with `batch_id=batchId`. Non-PDF entries collected in `skippedEntries` (not stored).
+3. If no PDF entries found → `400` with `"No PDF files found in archive"`.
+4. One `ESS_Payments_Document_Ingestion` instance **per extracted PDF**.
 
-1. Insert `fss_idp_upload` (status `UPLOADED` → `PROCESSING`).
-2. Insert `fss_idp_upload_content` (BLOB).
-3. `startWorkflow(IDP_Document_Ingestion)` with `businessKey = idpUploadId`.
-4. Camunda reaches `Trigger_IDP_Extraction` → gateway handler calls extraction service.
-
-**Response `201 Created`:**
+**Response `201 Created` (single PDF):**
 
 ```json
 {
-  "idpUploadId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "uploadStatus": "PROCESSING",
-  "idpWorkflowKey": "camunda-process-instance-id"
+  "uploadId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "uploadStatus": "PROCESSING"
 }
 ```
 
-**Errors:**
+**Response `201 Created` (ZIP bulk):**
 
-| HTTP | When |
-|------|------|
-| `400` | Missing file, invalid metadata, unsupported content type |
-| `401` / `403` | Not authenticated or not in `paymentMaker` group |
-| `413` | File exceeds max size |
-| `500` | DB or workflow start failure |
+```json
+{
+  "batchId": "batch-uuid",
+  "uploads": [
+    { "uploadId": "...", "fileName": "doc1.pdf", "uploadStatus": "PROCESSING" },
+    { "uploadId": "...", "fileName": "doc2.pdf", "uploadStatus": "PROCESSING" }
+  ],
+  "skippedEntries": ["readme.txt"]
+}
+```
 
----
+**Errors:** `400` missing file/invalid metadata/no PDFs in ZIP, `401`/`403` not in `paymentMaker` group, `413` file too large, `500` DB or workflow-start failure.
 
-### 2.3 `GET /v1/idp/uploads`
-
-List uploads for the upload tab.
-
-**Query parameters:**
+### 2.3 `GET /api/fss/payments/gateway/v1/extraction-uploads/getUploads`
 
 | Param | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `sort` | string | `recent` | `recent` = `uploaded_timestamp` DESC |
-| `country` | string | — | Filter by country (e.g. `ID`) |
-| `status` | string | — | Filter by `uploadStatus` |
-| `myUploads` | boolean | `false` | When `true`, only current user's uploads |
-| `page` | int | `0` | Page index |
-| `size` | int | `20` | Page size |
-
-**Example:** `GET /v1/idp/uploads?sort=recent&country=ID&myUploads=true`
+| `batchId` | string | - | Filter rows from the same ZIP upload |
+| `entity` | string | - | Filter by routing key (e.g. `ID`) |
+| `status` | string | - | Filter by `uploadStatus` |
+| `myUploads` | boolean | `false` | Current user only |
+| `page` / `size` | int | `0` / `20` | Paging |
 
 **Response `200 OK`:**
 
@@ -144,458 +137,306 @@ List uploads for the upload tab.
 {
   "content": [
     {
-      "idpUploadId": "a1b2c3d4-...",
+      "uploadId": "a1b2c3d4-...",
+      "batchId": null,
       "fileName": "3897122.pdf",
       "uploadedTimestamp": "2026-07-30T10:22:00Z",
       "uploadStatus": "READY_FOR_REVIEW",
       "overallConfidence": 97.23,
-      "uploadedBy": "maker.user",
+      "uploadedBy": "maker_user",
       "paymentRef": null,
-      "country": "ID",
-      "extractionRunId": "ext-run-uuid",
-      "idpWorkflowKey": "..."
+      "entity": "ID"
     }
   ],
-  "page": 0,
-  "size": 20,
-  "totalElements": 42
+  "page": 0, "size": 20, "totalElements": 42
 }
 ```
 
-**UI behaviour:**
+**UI behaviour:** poll every 5s while any row has `uploadStatus` in `UPLOADED`/`PROCESSING`; disable row click while `PROCESSING`.
 
-- Poll every **5 seconds** while any row has `uploadStatus` in `UPLOADED`, `PROCESSING`.
-- Disable row click when status is `PROCESSING` (see [IDP_UX_Design.md](./IDP_UX_Design.md) §3).
+**Upload status values:** `UPLOADED`, `PROCESSING`, `READY_FOR_REVIEW`, `SUBMITTED`, `HANDOFF_IN_PROGRESS`, `REJECTED`, `APPROVED`, `COMPLETED`, `FAILED`, `CANCELLED` — see [LLD §5.3](./IDP_LLD.md#53-status-lifecycle).
 
-**Upload status values:**
+### 2.4 `GET /api/fss/payments/gateway/v1/extraction-uploads/getDetail?uploadId={id}`
 
-| `uploadStatus` | Meaning | Row clickable |
-|----------------|---------|---------------|
-| `UPLOADED` | Persisted, workflow starting | No |
-| `PROCESSING` | OCR/LLM in progress | No |
-| `READY_FOR_REVIEW` | Extraction complete — maker review | Yes |
-| `SUBMITTED` | With checker | Yes |
-| `REJECTED` | Checker rejected | Yes (maker) |
-| `APPROVED` | Handed off to payment BPMN | Yes (read-only) |
-| `COMPLETED` | Payment path finished | Yes |
-| `FAILED` | Extraction failed | Yes |
-| `CANCELLED` | Maker cancelled | Optional |
-
----
-
-### 2.4 `GET /v1/idp/uploads/{id}`
-
-Load upload detail for the modal. Does **not** return the file blob.
+`uploadId` (= `fss_payment_upload_meta.id`) is a required `@RequestParam`. Does **not** return the file blob.
 
 **Response `200 OK`:**
 
 ```json
 {
-  "idpUploadId": "a1b2c3d4-...",
+  "uploadId": "a1b2c3d4-...",
   "fileName": "3897122.pdf",
-  "contentType": "application/pdf",
-  "fileSize": 245760,
-  "country": "ID",
-  "entity": null,
-  "deptId": "FundServices",
-  "processId": "Cash",
-  "subProcessId": "CI",
-  "activityId": "BT",
-  "subActivityId": "Redemption",
-  "uploadStatus": "READY_FOR_REVIEW",
-  "uploadedBy": "maker.user",
-  "uploadedTimestamp": "2026-07-30T10:22:00Z",
-  "approvedBy": null,
-  "approvedTimestamp": null,
-  "remarks": null,
-  "paymentRef": null,
-  "paymentId": null,
-  "idpWorkflowKey": "...",
-  "paymentWorkflowKey": null,
-  "extractionRun": {
-    "extractionRunId": "ext-run-uuid",
-    "runStatus": "READY_FOR_REVIEW",
-    "overallConfidence": 97.23,
-    "startedTimestamp": "2026-07-30T10:22:05Z",
-    "completedTimestamp": "2026-07-30T10:24:12Z",
-    "isLatest": true,
-    "errorCode": null,
-    "errorDescription": null
-  },
-  "structuredOutput": { },
-  "camundaTasks": [
+  "entity": "ID",
+  "status": "READY_FOR_REVIEW",
+  "uploadedBy": "maker_user",
+  "uploadedAt": "2026-07-30T10:22:00Z",
+  "processedAt": null,
+  "ingestDetails": [
     {
-      "taskId": "camunda-task-id",
-      "taskDefinitionKey": "IDP_MakerReview",
-      "assignee": "maker.user"
+      "detailId": "detail-uuid-1",
+      "instructionIndex": 0,
+      "status": "READY_FOR_REVIEW",
+      "confidenceScore": 97.23,
+      "txRef": "3897122-001",
+      "subActivityId": "Redemption",
+      "activityId": "BT",
+      "trnTyp": "Redemption",
+      "valueDate": "2025-10-29",
+      "clientName": "PT BNI ASSET MANAGEMENT",
+      "debitAmount": "5000000000",
+      "lowConfidenceFieldCount": 0,
+      "messageId": null,
+      "handoffAt": null,
+      "paymentId": null,
+      "retry": 0,
+      "errorDesc": null,
+      "extractedData": { "header": { "..." }, "initiationDetail": { "..." } }
     }
+  ],
+  "camundaTasks": [
+    { "taskId": "camunda-task-id", "taskDefinitionKey": "Extraction_MakerReview", "assignee": "maker_user" }
   ]
 }
 ```
 
-`structuredOutput` follows [../after_ocr-llm-output.json](../after_ocr-llm-output.json) — every extracted field includes `Confidence` (0–100). UI highlights fields where `Confidence < 90` (configurable).
+`ingestDetails` maps to `fss_payment_data_ingest_details` — one object per instruction. `extractedData` is the per-instruction `{ header, initiationDetail }` JSON. API query param remains `uploadId` (maps to `fss_payment_upload_meta.id`; legacy alias `extractionUploadId` accepted if needed).
 
-**Errors:**
+**Errors:** `404` unknown id, `403` cannot view this upload.
 
-| HTTP | When |
-|------|------|
-| `404` | Unknown `idpUploadId` |
-| `403` | User cannot view this upload |
+### 2.5 `POST /api/fss/payments/gateway/v1/extraction-uploads/fields?uploadId={id}&detailId={detailId}`
 
----
-
-### 2.5 `PATCH /v1/idp/uploads/{id}/fields`
-
-Maker saves draft edits without submitting to checker.
-
-**Allowed when:** `uploadStatus` is `READY_FOR_REVIEW` or `REJECTED`, and caller is `paymentMaker`.
+Saves maker edits for **one instruction** (`detailId` = `fss_payment_data_ingest_details.id`). Re-denormalizes summary columns on save.
 
 **Request body:**
 
 ```json
 {
-  "structuredOutput": {
-    "initiationDetail": {
-      "TxRef": "3897122-001",
-      "TransactionDetails": [
-        { "Name": "BankChg", "Value": "No", "Confidence": "99.0" }
-      ]
-    }
-  },
   "fields": [
-    {
-      "section": "TRANSACTION",
-      "legIndex": 0,
-      "fieldName": "BankChg",
-      "fieldValue": "No"
-    }
+    { "section": "TRANSACTION", "legIndex": null, "fieldName": "BankChg", "fieldValue": "No" },
+    { "section": "DEBIT", "legIndex": 0, "fieldName": "DrAccNo", "fieldValue": "30681655612" }
   ]
 }
 ```
 
-- Send full `structuredOutput` **or** granular `fields` array (server merges into `fss_idp_extraction_run.structured_output` and optional `fss_idp_extracted_field`).
-- Maker edits **values only** — original `Confidence` values are retained for audit.
+**Response `200 OK`:** `{ "uploadId": "...", "detailId": "...", "status": "READY_FOR_REVIEW", "savedAt": "..." }`
 
-**Response `200 OK`:**
+### 2.6 `POST /api/fss/payments/gateway/v1/extraction-uploads/re-extract?uploadId={id}`
 
-```json
-{
-  "idpUploadId": "a1b2c3d4-...",
-  "uploadStatus": "READY_FOR_REVIEW",
-  "extractionRunId": "ext-run-uuid",
-  "savedAt": "2026-07-30T10:30:00Z"
-}
-```
+**Allowed when:** meta `status` is `READY_FOR_REVIEW`, `REJECTED`, or `FAILED`, caller is `paymentMaker`. Resets all detail rows: `retry+1`, clear `extracted_data`/`error_desc`, `status=PROCESSING`; re-fire extraction.
+
+**Response `202 Accepted`:** `{ "uploadId": "...", "status": "PROCESSING" }`
 
 ---
 
-### 2.6 `POST /v1/idp/uploads/{id}/re-extract`
+## 3. Maker / checker action APIs — gateway façade (required)
 
-Trigger a new OCR + LLM pass on the same upload.
+> **v6 correction:** Earlier versions (v4) had the portal call `workflow-management` directly for Submit / Cancel / Approve / Reject. That **does not** update `fss_payment_upload_meta`, `fss_payment_data_ingest_details`, or `fss_payment_upload_audit`. **All four UI action buttons must go through the gateway** — the gateway owns DB + audit, then calls the existing `WorkflowServicesController` contract **server-side** via the same `WorkflowService` client already used for `startWorkflowProcess`.
 
-**Allowed when:** `uploadStatus` is `READY_FOR_REVIEW`, `REJECTED`, or `FAILED`, and caller is `paymentMaker`.
+**Base path:** `/api/fss/payments/gateway/v1/extraction-uploads`  
+**Auth:** JWT; `paymentMaker` for submit/cancel; `paymentChecker` for approve/reject.
 
-**Request body:** optional
+### 3.1 Action endpoints
+
+| Method | Path | Caller | Gateway DB status after success |
+| --- | --- | --- | --- |
+| `POST` | `/performAction?uploadId={id}` | Maker / Checker | Per `action` in body — **preferred** (see [LLD §9.4](./IDP_LLD.md#94-extractionuploadactionservice--single-entry-switch-inside-service)) |
+| `POST` | `/submit?uploadId={id}` | Maker | meta `SUBMITTED`; all details `SUBMITTED` |
+| `POST` | `/cancel?uploadId={id}` | Maker | meta `CANCELLED`; all details `CANCELLED` |
+| `POST` | `/approve?uploadId={id}` | Checker | meta `HANDOFF_IN_PROGRESS` → `APPROVED` when `ExtractionPaymentHandoffHandler` completes |
+| `POST` | `/reject?uploadId={id}` | Checker | meta `REJECTED`; all details `REJECTED` |
+
+**Request body (`performAction` — all actions):**
+
+```json
+{ "action": "SUBMIT", "remarks": "optional except REJECT" }
+```
+
+`action` values: `SUBMIT`, `CANCEL`, `APPROVE`, `REJECT`.
+
+**Request body (cancel / reject on alias endpoints):**
+
+```json
+{ "remarks": "Required for reject; optional for cancel" }
+```
+
+**Response `200 OK` (all actions):**
 
 ```json
 {
-  "reason": "Poor OCR quality on debit section"
+  "uploadId": "a1b2c3d4-...",
+  "status": "SUBMITTED",
+  "action": "MAKER_SUBMIT",
+  "actedAt": "2026-07-30T11:00:00Z",
+  "actedBy": "maker_user"
 }
 ```
 
-**Server actions:**
+**Errors:** `400` invalid status transition, `403` wrong role, `404` unknown upload, `409` no active Camunda task / already actioned, `502` workflow-management call failed (DB rolled back or left unchanged — see §3.3).
 
-1. Mark current run `is_latest = false`.
-2. Insert new `fss_idp_extraction_run` (`PENDING`).
-3. Set upload `uploadStatus = PROCESSING`.
-4. Signal workflow / re-fire extraction (same path as initial `Trigger_IDP_Extraction`).
+### 3.2 `ExtractionUploadActionService` orchestration (gateway Java)
 
-**Response `202 Accepted`:**
+Each action runs in this order:
 
-```json
-{
-  "idpUploadId": "a1b2c3d4-...",
-  "uploadStatus": "PROCESSING",
-  "extractionRunId": "new-ext-run-uuid"
-}
 ```
+1. Load fss_payment_upload_meta (+ details); verify caller role and allowed status transition
+2. Verify active Camunda task matches expected taskDefinitionKey (Extraction_MakerReview | Extraction_CheckerReview)
+3. BEGIN transaction
+4. INSERT fss_payment_upload_audit (action, actor, before_status, after_status, remarks, details JSON snapshot optional)
+5. UPDATE fss_payment_upload_meta.status (+ remarks, approved_by/approved_at on approve)
+6. UPDATE fss_payment_data_ingest_details.status in bulk where applicable
+7. COMMIT
+8. workflowClient.setTaskDetails(uploadId, vars)  // same vars as §3.4 table
+9. workflowClient.completeCurrentTask(uploadId)
+10. On workflow HTTP failure: compensating UPDATE to restore prior status + audit row FAILURE note; return 502
+11. On approve success: return immediately; meta → APPROVED when ExtractionPaymentHandoffHandler finishes (async)
+```
+
+**Idempotency:** reject duplicate `POST` with same action when status already terminal → `409`.
+
+### 3.3 Why not UI → workflow-management directly?
+
+| Concern | Direct WFM call | Gateway façade |
+| --- | --- | --- |
+| `fss_payment_upload_meta.status` | Stale until external task runs (often never for user tasks) | Updated in step 5 |
+| `fss_payment_data_ingest_details.status` | Not updated | Synced per action |
+| `fss_payment_upload_audit` | Not written | Written in step 4 |
+| UI table/modal | Wrong status on refresh | Correct immediately |
+| Checker `remarks` | Only in Camunda variables | Persisted on meta + audit |
+
+External task handlers (`ExtractionTriggerHandler`, `ExtractionPaymentHandoffHandler`) **still** update DB for system-driven steps (extraction complete, payment handoff). User-driven steps **must** use §3.1.
+
+### 3.4 Camunda variables (internal — gateway sets these server-side)
+
+The portal **does not** call these endpoints. The gateway uses the existing `WorkflowService` / REST client against `51786-workflow-management`:
+
+| UI action (gateway path) | Active task | Variables (`setTaskDetails`) | `completeCurrentTask` |
+| --- | --- | --- | --- |
+| `POST .../submit` | `Extraction_MakerReview` | `{ "makerAction": "SUBMIT" }` | yes |
+| `POST .../cancel` | `Extraction_MakerReview` | `{ "makerAction": "CANCEL", "remarks": "..." }` | yes |
+| `POST .../approve` | `Extraction_CheckerReview` | `{ "extractionApproved": true }` | yes |
+| `POST .../reject` | `Extraction_CheckerReview` | `{ "extractionApproved": false, "remarks": "..." }` | yes |
+
+Underlying WFM paths (unchanged):
+
+| Method | Path |
+| --- | --- |
+| `PUT` | `/api/fss/payments/workflow/v1/set/setTaskDetails/{uploadId}` |
+| `PUT` | `/api/fss/payments/workflow/v1/complete/completeCurrentTask/{uploadId}` |
+
+`uploadId` = Camunda business key = `fss_payment_upload_meta.id`.
+
+### 3.5 Status transitions (gateway-enforced)
+
+| Current meta `status` | Action | New meta `status` |
+| --- | --- | --- |
+| `READY_FOR_REVIEW`, `REJECTED` | `submit` | `SUBMITTED` |
+| `READY_FOR_REVIEW`, `REJECTED` | `cancel` | `CANCELLED` |
+| `SUBMITTED` | `approve` | `HANDOFF_IN_PROGRESS` → `APPROVED` (handler) |
+| `SUBMITTED` | `reject` | `REJECTED` |
+
+System-driven only (not UI buttons): `PROCESSING`, `FAILED`, `COMPLETED` — set by `ExtractionTriggerHandler` / `ExtractionPaymentHandoffHandler` / reconciliation.
+
+### 3.6 Superseded (v4)
+
+v4 stated no gateway proxy was needed because Cancel became a plain gateway completion. **v6 supersedes that:** the issue is not Camunda message correlation — it is **gateway table and audit consistency**. Workflow-management endpoints are reused **inside** the gateway, not from the browser.
 
 ---
 
-### 2.7 `POST /v1/workflow/complete` (existing — IDP task usage)
+## 4. Internal gateway API
 
-Generic Camunda task completion API already used by the payments portal. IDP reuses it for maker/checker human tasks — **no new country-specific complete endpoints**.
+### 4.1 `GET /api/fss/payments/gateway/v1/extraction-uploads/internal/getContent?extractionUploadId={id}`
 
-**Base path:** `/v1/workflow` (gateway-service)
-
-#### Maker — submit to checker
-
-Completes `IDP_MakerReview`. Sets upload `SUBMITTED`.
-
-```json
-{
-  "taskId": "camunda-task-id",
-  "variables": {
-    "idpStatus": "SUBMITTED"
-  }
-}
-```
-
-#### Checker — approve
-
-Completes `IDP_CheckerReview`. Triggers `Trigger_IDP_Payment` → registry → country payment BPMN.
-
-```json
-{
-  "taskId": "camunda-task-id",
-  "variables": {
-    "idpApproved": true,
-    "idpStatus": "APPROVED"
-  }
-}
-```
-
-#### Checker — reject
-
-Returns flow to maker. Sets upload `REJECTED`.
-
-```json
-{
-  "taskId": "camunda-task-id",
-  "variables": {
-    "idpApproved": false,
-    "idpStatus": "REJECTED",
-    "remarks": "Debit account number does not match statement"
-  }
-}
-```
-
-#### Maker — cancel upload
-
-Correlates `CancelIDPUpload` boundary message on `IDP_MakerReview`.
-
-```json
-{
-  "taskId": "camunda-task-id",
-  "messageName": "CancelIDPUpload",
-  "variables": {
-    "idpStatus": "CANCELLED"
-  }
-}
-```
-
-> **Note:** Exact request shape follows the existing gateway `WorkflowComplete` contract. Align field names with current portal payment task completion — IDP only adds the variables above.
-
-**Response `200 OK`:** standard workflow complete response (task closed, next task if any).
+Streams the uploaded file bytes from `fss_payment_upload_content` (via `fss_payment_upload_meta.file_content_id`) for `ExtractionTriggerHandler`. `uploadId` is a required `@RequestParam`.
 
 ---
 
-## 3. Internal gateway API
+## 5. Extraction service APIs - `51786-idp-extraction-service` (already built, unchanged)
 
-Not exposed to the portal. Service-to-service or ops only.
+**Base path:** `/v1/extract` · **Status:** Built · **Caller:** `payment-gateway-service` only.
 
-### 3.1 `GET /v1/idp/internal/uploads/{id}/content`
+### 5.1 `POST /v1/extract` (synchronous)
 
-Stream the uploaded file bytes from `fss_idp_upload_content`.
-
-| Header | Value |
-|--------|-------|
-| `Accept` | `application/octet-stream` or original `contentType` |
-
-**Caller:** `IDPTriggerExtractionHandler` (gateway loads blob and base64-encodes for extraction service), or idp-extraction-service if configured to fetch content by URL.
-
-**Auth:** Internal service token / mTLS — not portal JWT.
-
-**Response `200 OK`:** raw file bytes.
-
-**Errors:** `404` if upload or content row missing.
-
----
-
-## 4. Extraction service APIs — `51786-idp-extraction-service`
-
-**Base path:** `/v1/extract`  
-**Status:** **Implemented** (mock mode available)  
-**Caller:** `payment-gateway-service` only (not portal)
-
-Domain-agnostic — no Camunda, no payment tables. Technical audit in `idp_extraction_audit`.
-
-### 4.1 `POST /v1/extract` (synchronous)
-
-Run OCR + LLM for one document. **Blocks** until complete or failure (phase 1). Gateway HTTP read timeout: **15 min**.
-
-**Request `application/json`:**
+**Request:**
 
 ```json
 {
   "templateId": "id-payment-v1",
-  "correlationId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "correlationId": "extraction-upload-id",
   "fileName": "3897122.pdf",
   "fileContent": "<base64-encoded-bytes>",
   "locale": "id-ID",
-  "metadata": {
-    "deptId": "FundServices",
-    "processId": "Cash",
-    "subProcessId": "CI",
-    "country": "ID"
-  }
+  "metadata": { "deptId": "FundServices", "processId": "Cash", "subProcessId": "CI", "entity": "ID" }
 }
 ```
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `templateId` | Yes | Template manifest under `templates/{templateId}/` — phase 1: `id-payment-v1` |
-| `correlationId` | No | Opaque caller reference — gateway sets to `idpUploadId` |
-| `fileName` | No | Original filename (prompt context) |
-| `fileContent` | No* | Base64 document bytes — gateway supplies from upload content |
-| `locale` | No | e.g. `id-ID` for Indonesia |
-| `metadata` | No | Passed into LLM user prompt |
+Gateway sends `entity` in metadata. If the built extraction service still reads `country` from metadata, `ExtractionServiceClient` adds `"country": entity` when building the request — adapter only, not a separate upload field.
 
-\*Required in production when OCR runs on document bytes; optional in mock mode.
+**Response `200 OK` (`status=COMPLETED`):** LLM `structuredOutput` contains **`initiationDetail` array only**; gateway merges `header` before persist. Full stored shape: [LLD §6.2](./IDP_LLD.md#62-real-structuredoutput-shape-verbatim-confirmed-against-the-built-fixture) and [Design doc §6.3](./IDP_Document_Ingestion_Design.md#63-llm-output-vs-stored-structured_output).
 
-**Response `200 OK` (success):**
+**Response `422 Unprocessable Entity` (`status=FAILED`):**
 
 ```json
 {
-  "extractionId": "ext-audit-uuid",
-  "templateId": "id-payment-v1",
-  "correlationId": "a1b2c3d4-...",
-  "status": "COMPLETED",
-  "structuredOutput": { },
-  "ocrTraceId": "ocr-job-id",
-  "processingTimeMs": 45230,
-  "errorCode": null,
-  "errorDescription": null
+  "extractionId": "ext-audit-uuid", "templateId": "id-payment-v1", "correlationId": "...",
+  "status": "FAILED", "structuredOutput": null, "ocrTraceId": null,
+  "processingTimeMs": 12000, "errorCode": "OCR_TIMEOUT", "errorDescription": "OCR read exceeded 420000ms"
 }
 ```
 
-**Response `422 Unprocessable Entity` (pipeline failure):**
+**Gateway handler must treat 200 and 422 as two distinct, both-successful-HTTP-call outcomes** - see [Design doc §4.4](./IDP_Document_Ingestion_Design.md#44-how-gateway-knows-extraction-is-done). Only connection errors/timeouts are retryable.
 
-```json
-{
-  "extractionId": "ext-audit-uuid",
-  "templateId": "id-payment-v1",
-  "correlationId": "a1b2c3d4-...",
-  "status": "FAILED",
-  "structuredOutput": null,
-  "ocrTraceId": null,
-  "processingTimeMs": 12000,
-  "errorCode": "OCR_TIMEOUT",
-  "errorDescription": "OCR read exceeded 420000ms"
-}
-```
+### 5.2 `GET /v1/extract/{extractionId}`
 
-**`status` values:** `PENDING`, `OCR_IN_PROGRESS`, `LLM_IN_PROGRESS`, `COMPLETED`, `FAILED` (sync API typically returns terminal `COMPLETED` or `FAILED`).
-
-**Gateway handler after success:**
-
-1. Persist `structured_output`, `overall_confidence` on `fss_idp_extraction_run`.
-2. Set upload `READY_FOR_REVIEW`.
-3. Complete Camunda `Trigger_IDP_Extraction`.
-4. Correlate `IDPExtractionCompleted`.
+Retrieve extraction audit by technical id - used for gateway crash-recovery (idempotency) and ops troubleshooting. Same response shape as §5.1.
 
 ---
 
-### 4.2 `GET /v1/extract/{extractionId}`
+## 6. UI action -> API map
 
-Retrieve extraction audit by technical id. Used for **recovery/troubleshooting** when gateway retries after crash.
-
-**Response `200 OK`:** same shape as `POST /v1/extract` response.
-
-**Use cases:**
-
-| Scenario | Action |
-|----------|--------|
-| Gateway crash after HTTP 200, before DB save | Retry handler; `GET` by `extractionId` from prior response |
-| Idempotency check | Query audit by `correlationId` (= `idpUploadId`) before re-running OCR |
-| Ops / support | Inspect OCR trace, error codes, processing time |
-
----
-
-## 5. UI action → API map
+`GW` = `/api/fss/payments/gateway/v1/extraction-uploads` · `WFM` = `/api/fss/payments/workflow/v1`
 
 | User action | API | Upload status after |
-|-------------|-----|---------------------|
-| Open upload tab | `GET /v1/idp/uploads?sort=recent&country=ID` | — |
-| Click Upload | `POST /v1/idp/uploads` | `PROCESSING` |
-| Table auto-refresh | `GET /v1/idp/uploads?sort=recent` (poll 5s) | — |
-| Click enabled row | `GET /v1/idp/uploads/{id}` | — |
-| Save draft | `PATCH /v1/idp/uploads/{id}/fields` | unchanged |
-| Submit to checker | `POST /v1/workflow/complete` (`IDP_MakerReview`) | `SUBMITTED` |
-| Approve | `POST /v1/workflow/complete` (`IDP_CheckerReview`, `idpApproved=true`) | `APPROVED` |
-| Reject | `POST /v1/workflow/complete` (`idpApproved=false`) | `REJECTED` |
-| Re-extract | `POST /v1/idp/uploads/{id}/re-extract` | `PROCESSING` |
-| Cancel upload | `POST /v1/workflow/complete` (`CancelIDPUpload`) | `CANCELLED` |
-| View payment | Navigate to existing payment detail (uses `paymentId` / `paymentRef` from upload) | — |
-
----
-
-## 6. Background flows (no portal API)
-
-These steps run inside Camunda external task handlers — documented here for completeness.
-
-| External task topic | Handler | Calls |
-|---------------------|---------|-------|
-| `Trigger_IDP_Extraction` | `IDPTriggerExtractionHandler` | `POST /v1/extract` (sync) |
-| `Trigger_IDP_Payment` | `IDPTriggerPaymentHandler` | `IDPPaymentRouteRegistry.resolve()` → `startMessageCorrelation` |
-| `Initialize_IAP_From_IDP` | `IAPIDPInitializeHandler` | Load `structured_output` → map to Payment/Message |
-
-**Phase 1 routing (registry):**
-
-| `country` | `messageName` | `processDefinitionKey` |
-|-----------|---------------|------------------------|
-| `ID` | `IAP_ID_IDP_Trigger` | `IAP_ID_Payments` |
-
-See [IDP_LLD.md §4](./IDP_LLD.md#4-country--entity-routing).
+| --- | --- | --- |
+| Open upload tab | `GET {GW}/getUploads?sort=recent&entity=ID` | - |
+| Click Upload | `POST {GW}` | `PROCESSING` |
+| Table auto-refresh | `GET {GW}/getUploads?sort=recent` (poll 5s) | - |
+| Click enabled row | `GET {GW}/getDetail?extractionUploadId={id}` | - |
+| Save draft | `POST {GW}/fields?uploadId={id}&detailId={detailId}` | unchanged |
+| Submit to checker | `POST {GW}/performAction?uploadId={id}` `{ "action": "SUBMIT" }` or `POST {GW}/submit?uploadId={id}` | `SUBMITTED` |
+| Approve | `POST {GW}/performAction?uploadId={id}` `{ "action": "APPROVE" }` or `POST {GW}/approve?uploadId={id}` | `HANDOFF_IN_PROGRESS` → `APPROVED` |
+| Reject | `POST {GW}/performAction?uploadId={id}` `{ "action": "REJECT", "remarks": "..." }` or `POST {GW}/reject?uploadId={id}` | `REJECTED` |
+| Re-extract | `POST {GW}/re-extract?uploadId={id}` | `PROCESSING` |
+| Cancel upload | `POST {GW}/performAction?uploadId={id}` `{ "action": "CANCEL" }` or `POST {GW}/cancel?uploadId={id}` | `CANCELLED` |
+| View payment | Navigate to existing payment detail (uses `paymentId` / `paymentRef`) | - |
 
 ---
 
 ## 7. Timeouts and limits
 
-| Layer | Value | Notes |
-|-------|-------|-------|
-| OCR + LLM budget | 10 min | Extraction service pipeline |
-| Gateway → extraction HTTP read | 15 min | Must exceed pipeline budget |
-| Camunda `Trigger_IDP_Extraction` lock | PT15M | Handler blocks on sync extract |
-| Upload max file size | TBD | Enforce on `POST /uploads` |
-| List poll interval | 5 s | UI only — while `PROCESSING` rows exist |
-
-Load balancers and API gateways on the gateway → extraction path must use **≥ 15 min** idle/read timeout.
+Unchanged real values from the built extraction service, plus new gateway-side config - see [Design doc §4.5](./IDP_Document_Ingestion_Design.md#45-timeout-configuration-10-min-ocrllm-budget).
 
 ---
 
 ## 8. Error handling summary
 
 | API | Failure | Client behaviour |
-|-----|---------|------------------|
-| `POST /uploads` | 5xx | Show error; user retries upload |
-| `POST /v1/extract` (internal) | 422 / timeout | Upload → `FAILED`; row clickable for re-extract |
-| `PATCH /fields` | 409 wrong status | Show "cannot edit in current status" |
-| `POST /re-extract` | 409 already processing | Disable button |
-| `POST /workflow/complete` | 409 task already completed | Refresh modal / table |
-
-Gateway reconciliation job (no public API): uploads stuck `PROCESSING` with run `READY_FOR_REVIEW` → re-correlate `IDPExtractionCompleted`.
+| --- | --- | --- |
+| `POST {GW}` (create upload) | 5xx | Show error; user retries upload |
+| Extraction (internal) | `422` | Upload -> `FAILED`; row clickable for re-extract |
+| Extraction (internal) | timeout | Retried by handler; row stays `PROCESSING`, then `FAILED` after retries exhausted |
+| `POST {GW}/fields` | `409` wrong status | "Cannot edit in current status" |
+| `POST {GW}/re-extract` | `409` already processing | Disable button |
+| `workflow-management` task calls (via gateway) | `502` workflow down after DB commit | Reconciliation restores status; user refreshes |
+| `POST {GW}/submit` etc. | `409` wrong status | "Action not allowed in current status" |
 
 ---
 
 ## 9. Implementation status
 
 | API | Service | Status |
-|-----|---------|--------|
-| `POST /v1/extract` | idp-extraction-service | **Built** |
-| `GET /v1/extract/{id}` | idp-extraction-service | **Built** |
-| `POST /v1/idp/uploads` | payment-gateway-service | Planned |
-| `GET /v1/idp/uploads` | payment-gateway-service | Planned |
-| `GET /v1/idp/uploads/{id}` | payment-gateway-service | Planned |
-| `PATCH /v1/idp/uploads/{id}/fields` | payment-gateway-service | Planned |
-| `POST /v1/idp/uploads/{id}/re-extract` | payment-gateway-service | Planned |
-| `GET /v1/idp/internal/uploads/{id}/content` | payment-gateway-service | Planned |
-| `POST /v1/workflow/complete` | payment-gateway-service | **Existing** — extend for IDP variables |
-
----
-
-## 10. Document history
-
-| Date | Change |
-|------|--------|
-| 2026-08-02 | Initial API reference for final documentation pack |
+| --- | --- | --- |
+| `POST /v1/extract`, `GET /v1/extract/{id}` | `51786-idp-extraction-service` | **Built** |
+| `POST/GET {GW}`, `{GW}/getUploads`, `{GW}/getDetail`, `{GW}/fields`, `{GW}/re-extract` (`GW = /api/fss/payments/gateway/v1/extraction-uploads`) | `payment-gateway-service` | **Planned** |
+| `GET {GW}/internal/getContent` | `payment-gateway-service` | **Planned** |
+| `POST {GW}/performAction`, `/submit`, `/cancel`, `/approve`, `/reject` | `payment-gateway-service` | **Planned** — gateway façade; updates DB + audit then calls WFM server-side |
+| `PUT .../set/setTaskDetails`, `PUT .../complete/completeCurrentTask` | `workflow-management` | **Existing** — called **by gateway only**, not by portal UI for this feature |

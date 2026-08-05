@@ -1,8 +1,8 @@
-# IDP Document Upload — UX Design Specification (Simplified)
+# ESS Payments Document Upload — UX Design Specification
 
-> **Status:** **Final** — UX specification (see [README.md](./README.md))  
-> **Created:** 2026-07-30 · **Finalized:** 2026-08-02  
-> **Related:** [README.md](./README.md) · [IDP_Document_Ingestion_Design.md](./IDP_Document_Ingestion_Design.md) · [IDP_LLD.md](./IDP_LLD.md) · [../after_ocr-llm-output.json](../after_ocr-llm-output.json)
+> **Status:** **Final v4** — ZIP bulk upload, multi-instruction review (see [README.md](./README.md))  
+> **Created:** 2026-07-30 · **Finalized:** 2026-08-04  
+> **Related:** [README.md](./README.md) · [IDP_Document_Ingestion_Design.md](./IDP_Document_Ingestion_Design.md) · [IDP_LLD.md](./IDP_LLD.md) · [IDP_API_Reference.md](./IDP_API_Reference.md) · [../after_ocr-llm-output.json](../after_ocr-llm-output.json)
 
 ---
 
@@ -60,7 +60,7 @@
 | Base route | Existing landing, e.g. `/payments/id` or current dashboard path — **unchanged** |
 | Default tab | `dashboard` |
 | Upload tab | `?tab=instruction-upload` (or final slug from §2.1.1) |
-| Deep link to row | `?tab=instruction-upload&uploadId={idpUploadId}` → opens modal on load |
+| Deep link to row | `?tab=instruction-upload&uploadId={extractionUploadId}` → opens modal on load |
 
 ### 2.3 Landing page wireframe (tabs)
 
@@ -87,27 +87,28 @@ Same single-surface pattern as before — **all IDP functionality lives in this 
 │  [ Dashboard ]  [ Upload & review * ● ]                                   │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ UPLOAD PAYMENT DOCUMENT                                                 │
-│ Country [ID]  Dept ▼  Process ▼  SubProcess ▼  Activity ▼  SubAct ▼    │
-│ [ Choose file ] 3897122.pdf          [ Upload ]                         │
+│ Entity [ID]  Dept ▼  Process ▼  SubProcess ▼  Activity ▼  SubAct ▼    │
+│ [ Choose file ] 3897122.pdf or batch.zip   [ Upload ]                   │
+│ Accepts: .pdf (single) or .zip (multiple PDFs inside; other files ignored) │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ UPLOADS                                          Recent first             │
 ├──────────────┬────────────┬──────────────┬────────────┬────────────────┤
 │ File name    │ Uploaded   │ Status       │ By         │ Payment ref    │
 ├──────────────┼────────────┼──────────────┼────────────┼────────────────┤
-│ 3897122.pdf  │ 10:22 today│ Ready review │ you        │ —              │  ← clickable
+│ 3897122.pdf  │ 10:22 today│ Ready review │ you        │ — (2 payments) │  ← clickable; multi-instruction
 │ 3897011.pdf  │ 09:15 today│ Processing   │ you        │ —              │  ← disabled
 │ 3896990.pdf  │ yesterday  │ With checker │ jsmith     │ —              │  ← clickable
 │ 3896880.pdf  │ yesterday  │ Completed    │ you        │ PAY-12345      │  ← clickable
 └──────────────┴────────────┴──────────────┴────────────┴────────────────┘
 ```
 
-After upload: stay on **upload tab**; new row appears at top with `Processing`.
+After upload: stay on **upload tab**; new row(s) appear at top with `Processing`. ZIP uploads create **one table row per PDF** (shared `batchId`); show a toast summarising count and any `skippedEntries`.
 
 **Table rules**
 
 - Sort: `uploaded_timestamp` descending (recent first)  
 - Auto-refresh every 5s while any row is processing (pause when modal open)  
-- Optional filters: Status, date range, My uploads only  
+- Optional filters: Status, date range, My uploads only, **Batch ID** (for ZIP uploads)  
 
 ---
 
@@ -128,27 +129,88 @@ Disabled row tooltip: *“Still processing — available when extraction complet
 
 ---
 
-## 4. Detail modal
+## 4. Detail modal — multi-instruction review (10–20 per file)
 
-Clicking an **enabled** row opens a **large modal** over the landing page (upload tab stays active).
+Tabs **do not scale** beyond ~5 instructions. Use a **master–detail** layout: scrollable instruction list on the left, full field editor on the right.
+
+### 4.1 Layout (recommended)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 3897122.pdf                                    Status: Ready for review │
-│ Upload ID: …7122  ·  Run: ext-a1b2…  ·  Overall: 97.2%          [ × ]                      │
-├──────────────────────┬──────────────────────────────────────────────────┤
-│ DOCUMENT (optional)  │ EXTRACTED FIELDS (Field | Value | Confidence)    │
-│ [ PDF preview ]      │ Transaction · Debit · Credit grids                 │
-├──────────────────────┴──────────────────────────────────────────────────┤
-│ Comments                                                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  [ role + status buttons — §5 ]                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 3897122.pdf · 18 instructions · Ready for review          Min conf: 87.1% [×]│
+├───────────────────────────────┬──────────────────────────────────────────────┤
+│ INSTRUCTIONS (18)             │ INSTRUCTION 7 — 3897122-007                  │
+│ [Search…] [SubAct ▼] [BT|OTT] │ SubActivity: Subscription · TrnTyp: BT       │
+│ ┌────┬──────────┬─────┬──────┐│ ┌──────────────────────────────────────────┐ │
+│ │ #  │ TxRef    │SubAct│Conf││ │ TRANSACTION DETAILS (editable grid)      │ │
+│ ├────┼──────────┼─────┼──────┤│ │ Field          │ Value      │ Conf       │ │
+│ │ 1  │ …-001    │ Red │ 97 ││ │ │ TrnTyp         │ Redemption │ 94.7       │ │
+│ │ 2  │ …-002    │ Sub │ 95 ││ │ │ ClntNm         │ PT BNI…    │ 93.2       │ │
+│ │…   │          │     │    ││ │ │ ValDt          │ 2025-10-29 │ 94.0       │ │
+│ │ 7● │ …-007    │ Sub │ 88⚠││ │ └──────────────────────────────────────────┘ │
+│ │…   │          │     │    ││ │ DEBIT / CREDIT legs (same grid pattern)      │
+│ │ 18 │ …-018    │ OTT │ 96 ││ │                                              │
+│ └────┴──────────┴─────┴──────┘│                                              │
+├───────────────────────────────┴──────────────────────────────────────────────┤
+│ ⚠ 3 instructions below confidence threshold · [Show low-confidence only]      │
+│ Comments (file-level)                                                          │
+│ [ Save draft ]  [ Submit to checker ]  [ Re-extract ]  [ Cancel upload ]      │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Fields: same as [../after_ocr-llm-output.json](../after_ocr-llm-output.json) (TransactionDetails, DebitDetails, CreditDetails). Each field row shows LLM **Confidence** (0–100). Header shows **overall confidence** from `fss_idp_extraction_run.overall_confidence` (same as `initiationDetail.Confidence1`).
+### 4.2 Instruction list (left panel)
 
-**Low-confidence highlight:** fields with `Confidence < 90` (configurable) — amber/warning style. Maker edits **values** only; original confidence is preserved for audit.
+Data source: `GET .../getDetail?uploadId=` → `ingestDetails[]` (one row per `fss_payment_data_ingest_details`).
+
+| Column | Source | Purpose |
+|--------|--------|---------|
+| `#` | `instructionIndex + 1` | Row number |
+| `TxRef` | `tx_ref` (denormalized) | Quick identity |
+| `SubAct` | `sub_activity_id` | Redemption / Subscription / … |
+| `Type` | `activity_id` or `trn_typ` | BT / OTT badge |
+| `ValDt` | `value_date` | Sortable |
+| `Amount` | `debit_amount` | Optional |
+| `Conf` | `confidence_score` | Color-coded |
+| `⚠` | `low_confidence_field_count > 0` | Needs attention |
+
+**Interactions:**
+
+- **Search** — filter by TxRef, client name, account number (server-side or client filter on denormalized fields).
+- **SubActivity filter** — multi-select chips (Redemption, Subscription, …) from distinct values in the batch.
+- **BT / OTT toggle** — filter by `activity_id`.
+- **“Low confidence only”** — hides rows where all fields pass threshold.
+- **Keyboard** — ↑/↓ moves selection; right panel updates without closing modal.
+- **Row click** — loads `extracted_data` field grids in right panel; **Save draft** persists edits for **selected** `detailId` only.
+
+### 4.3 Right panel (field editor)
+
+Same field grids as today (`TransactionDetails`, `DebitDetails`, `CreditDetails`) scoped to **one** `ingestDetails[].extractedData`. Low-confidence cells highlighted (`Confidence < 90`).
+
+After checker approve, show **Payment link** per row when `message_id` is set (`handoff_at` populated).
+
+### 4.4 Uploads table (landing)
+
+| File name | Uploaded | Status | Instructions | Min conf | By |
+|-----------|----------|--------|--------------|----------|-----|
+| 3897122.pdf | today | Ready | **18** (3⚠) | 87.1% | you |
+
+Do **not** list 18 rows on the landing table — one row per **PDF**; drill into modal for instructions.
+
+### 4.5 Why this fits the data model
+
+| Layer | Camunda | DB | UI |
+|-------|---------|-----|-----|
+| File | 1× `ESS_Payments_Document_Ingestion` per PDF | 1× `fss_payment_upload_meta` | 1 uploads-table row |
+| Instruction | N/A until handoff | N× `fss_payment_data_ingest_details` | N rows in left panel |
+| Payment | N× `IAP_ID_Payments` after approve | N× `message_id` on detail rows | N payment links post-approve |
+
+One maker/checker task reviews **the whole file**; each instruction still gets its own `fss_services_message` and payment process at handoff.
+
+---
+
+## 4.6 Detail modal (legacy wireframe — 2-instruction tabs)
+
+For files with **≤5** instructions, horizontal tabs remain acceptable. Default to master–detail when `ingestDetails.length > 5` (configurable).
 
 ---
 
@@ -170,12 +232,12 @@ Fields: same as [../after_ocr-llm-output.json](../after_ocr-llm-output.json) (Tr
 | `SUBMITTED` | Read-only | Approve · Reject (comment required) · Close |
 | Other | Read-only | Close · View payment (if done) |
 
-| Button | Camunda / API |
-|--------|----------------|
-| Submit to checker | Complete `IDP_MakerReview` |
-| Approve / Reject | Complete `IDP_CheckerReview` |
-| Cancel upload | `CancelIDPUpload` |
-| Re-extract | `POST .../re-extract` → row returns to Processing |
+| Button | Gateway API (not workflow-management) |
+|--------|--------------------------------------|
+| Submit to checker | `POST .../performAction?uploadId={id}` `{ "action": "SUBMIT" }` or `POST .../submit?uploadId={id}` |
+| Approve / Reject | `POST .../performAction` `{ "action": "APPROVE" \| "REJECT" }` or `/approve` / `/reject` |
+| Cancel upload | `POST .../performAction` `{ "action": "CANCEL" }` or `POST .../cancel?uploadId={id}` |
+| Re-extract | `POST .../re-extract?uploadId={id}` → row returns to Processing |
 
 ---
 
@@ -288,23 +350,24 @@ See [IDP_API_Reference.md](./IDP_API_Reference.md) for full request/response sha
 
 | Interaction | API |
 |-------------|-----|
-| Tab load | `GET /v1/idp/uploads?sort=recent` |
-| Upload | `POST /v1/idp/uploads` |
-| Table poll | `GET /v1/idp/uploads?sort=recent` every 5s if processing rows exist |
-| Open modal | `GET /v1/idp/uploads/{id}` |
-| Save draft | `PATCH /v1/idp/uploads/{id}/fields` |
-| Submit / Approve / Reject | `POST /v1/workflow/complete` |
-| Re-extract | `POST /v1/idp/uploads/{id}/re-extract` |
-| View payment | Navigate to existing payment detail route |
+| Tab load | `GET /api/fss/payments/gateway/v1/extraction-uploads/getUploads?sort=recent` |
+| Upload (PDF or ZIP) | `POST /api/fss/payments/gateway/v1/extraction-uploads` |
+| Table poll | `GET .../getUploads?sort=recent` every 5s if processing rows exist |
+| Open modal | `GET .../getDetail?extractionUploadId={id}` |
+| Save draft | `POST .../fields?extractionUploadId={id}` |
+| Submit / Approve / Reject / Cancel | `POST .../performAction?uploadId={id}` with `{ "action": "…" }` (preferred) or `/submit`, `/cancel`, `/approve`, `/reject` — **never** direct `workflow-management` |
+| Re-extract | `POST .../re-extract?extractionUploadId={id}` |
+| View payment(s) | Navigate to payment detail per `paymentHandoffs[]` entry |
 
 ### 8.6 Backend / workflow
 
 | UI action | Workflow effect |
 |-----------|-----------------|
-| Upload | Starts `IDP_Document_Ingestion` (common process — not country payment BPMN) |
-| Checker approve | Completes `IDP_CheckerReview` → `Trigger_IDP_Payment` → gateway registry resolves handoff message (phase 1: `IAP_ID_IDP_Trigger` when `country=ID`) |
+| Upload (PDF) | Starts `ESS_Payments_Document_Ingestion` — one instance per PDF |
+| Upload (ZIP) | Unpacks PDFs; one ingestion instance **per PDF**; shared `batchId` |
+| Checker approve | `POST .../approve?uploadId={id}` → gateway DB + audit → `Extraction_CheckerReview` complete → `Trigger_Payment_From_Extraction` → **N ×** `IAP_ID_Extraction_Trigger` |
 
-UI change is **placement on landing tabs**, not workflow change. Country routing is config-driven in gateway — see [IDP_Document_Ingestion_Design.md §2.1](./IDP_Document_Ingestion_Design.md#21-country--payment-routing-responsibilities) and [IDP_LLD.md §4](./IDP_LLD.md#4-country--entity-routing).
+UI change is **placement on landing tabs**, not workflow change. Entity routing is config-driven in gateway — see [IDP_Document_Ingestion_Design.md §2.1](./IDP_Document_Ingestion_Design.md#21-entity--payment-routing-responsibilities) and [IDP_LLD.md §4](./IDP_LLD.md#4-entity-routing--template-config).
 
 ### 8.7 Implementation checklist
 

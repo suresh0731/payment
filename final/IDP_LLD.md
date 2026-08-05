@@ -1,51 +1,44 @@
-# IDP Document Upload — Low Level Design (LLD)
+# ESS Payments Document Ingestion — Low Level Design (LLD)
 
-> **Status:** **Final** — implementation LLD (see [README.md](./README.md))  
-> **Created:** 2026-07-30 · **Finalized:** 2026-08-02  
-> **Related:** [README.md](./README.md) · [IDP_UX_Design.md](./IDP_UX_Design.md) · [IDP_Document_Ingestion_Design.md](./IDP_Document_Ingestion_Design.md) · [IDP_Document_Ingestion.bpmn](./IDP_Document_Ingestion.bpmn) · [../ID_payments.md](../ID_payments.md) · [../after_ocr-llm-output.json](../after_ocr-llm-output.json)
+> **Status:** Final v7 — **implementation guide** (extensibility patterns, interfaces, entity routing, Jackson POJOs, Camunda handlers)
+> **Created:** 2026-07-30 · **Corrected:** 2026-08-03 (v2/v3) · **Corrected:** 2026-08-04 (v4/v6) · **Corrected:** 2026-08-04 (v7)
+> **Canonical:** **This file (`IDP_LLD.md`) is the only LLD to use for implementation.** Run [IDP_LLD_REPO_SCAN_PROMPT.md](./IDP_LLD_REPO_SCAN_PROMPT.md) against active code repos before coding.
+> **Related:** [README.md](./README.md) · [IDP_Document_Ingestion_Design.md](./IDP_Document_Ingestion_Design.md) · [IDP_UX_Design.md](./IDP_UX_Design.md) · [ESS_Payments_Document_Ingestion.bpmn](./ESS_Payments_Document_Ingestion.bpmn) · [../IAP_ID_Payments.md](../IAP_ID_Payments.md)
 
 ---
 
 ## 1. Purpose and scope
 
-This LLD translates the UX specification and ingestion design into implementable detail: **one common IDP Camunda process for all countries**, **additive triggers on each country-specific payment BPMN**, **database schema**, **REST contracts**, and **Java/UI implementation strategy**.
+Implementable detail for: one common `ESS_Payments_Document_Ingestion` Camunda process (file `ESS_Payments_Document_Ingestion.bpmn`), an additive trigger proposed on `IAP_ID_Payments.bpmn`, database schema (manual SQL only), REST contracts (built on the **real** `WorkflowServicesController`), and Java/UI implementation strategy.
 
-### 1.1 Design evolution (from prior docs)
+### 1.1 In scope (v1)
 
-| Prior decision ([IDP_Document_Ingestion_Design.md](./IDP_Document_Ingestion_Design.md)) | LLD refinement |
-|------------------------------------------------------------------------------------------|----------------|
-| Common `IDP_Document_Ingestion.bpmn` + ID-only `IAP_ID_IDP_Trigger` handoff | **Confirmed and extended:** common IDP BPMN is **country-agnostic**; handoff message is **selected at runtime** from `country` / `entity` chosen in UI |
-| Indonesia-first (`country = ID`) | **Phase 1 = ID**; registry pattern allows CN ETF and others without new IDP BPMN |
-| Two BPMN files (IDP + additive IAP) | **Same pattern per country payment process** — not a single merged IAP file (obsolete single-BPMN draft retired; see `draft/IDP_ID_Payments_Enhancement.md` for history only) |
+- Landing-page tab UX for Indonesia entity (`entity=ID`)
+- `ESS_Payments_Document_Ingestion` workflow (upload -> data extraction -> extraction maker/checker)
+- ZIP bulk upload (one upload row + workflow per PDF inside the archive; non-PDF ZIP entries ignored)
+- Additive 4th entry on `IAP_ID_Payments` (`IAP_ID_Extraction_Trigger`) — **proposal, not applied**
+- Manual SQL DDL for `fss_payment_upload_*` + `fss_payment_data_ingest_details` tables
+- Gateway REST + external task handlers (new)
+- `51786-idp-extraction-service` — **already built**, contract documented as-is
 
-### 1.2 In scope (v1)
+### 1.2 Out of scope (v1)
 
-- Landing-page tab UX ([IDP_UX_Design.md](./IDP_UX_Design.md)) for **Indonesia (ID)** payments
-- Common `IDP_Document_Ingestion` workflow (upload → OCR/LLM → IDP maker/checker)
-- Additive 4th entry on `IAP_ID_Payments` (`IAP_ID_IDP_Trigger`)
-- DDL for `fss_idp_*` tables
-- Gateway REST + external task handlers
-- New `51786-idp-extraction-service`
-
-### 1.3 Out of scope (v1)
-
-- Batch multi-file upload
 - New sidebar nav route
-- China ETF IDP handoff (registry entry only — implement in phase 2)
-- SSTM feedback changes for `channel=IDP_UPLOAD`
-- `51786-document-service` integration (Phase 2 — Phase 1 uses in-table BLOB + lazy fetch)
+- China ETF extraction handoff (registry entry only, phase 2)
+- SSTM feedback changes for `channel=DOC_EXTRACTION`
+- `51786-document-service` integration (phase 2 — phase 1 uses in-table BLOB + lazy fetch)
+- Feature flag (none — see §8)
+- Liquibase/Flyway (not used anywhere in this codebase — see §5)
 
-### 1.4 Domain glossary (avoid “job” confusion)
+### 1.3 Domain glossary
 
 | Term | Table / artifact | Meaning |
-|------|------------------|---------|
-| **Upload** | `fss_idp_upload` | User-facing document + business status (`idp_upload_id`) |
-| **Upload content** | `fss_idp_upload_content` | PDF/image bytes (lazy-fetched) |
-| **Extraction run** | `fss_idp_extraction_run` | One OCR + LLM pass on an upload; re-extract = new run (`extraction_run_id`) |
-| **Review payload** | `structured_output` CLOB (+ optional `fss_idp_extracted_field`) | Canonical JSON the maker/checker view and edit |
-| **Workflow** | Camunda `IDP_Document_Ingestion` | Orchestration only — passes `idpUploadId`, not payloads |
-
-**Not** a Quartz/cron/scheduled job. Code and UI should say *upload*, *extraction run*, or *re-extract* — not *job*.
+|---|---|---|
+| **Upload (meta)** | `fss_payment_upload_meta` | One row per PDF file — file name, entity, file-level `status`, link to BLOB (`id` = Camunda business key for `ESS_Payments_Document_Ingestion`) |
+| **Upload content** | `fss_payment_upload_content` | PDF bytes (lazy-fetched via `file_content_id` on meta) |
+| **Ingest detail** | `fss_payment_data_ingest_details` | One row per `initiationDetail` instruction — `extracted_data`, per-instruction `status`, `confidence_score`, workflow keys, `retry`, `error_desc` |
+| **Review payload** | `extracted_data` CLOB (on ingest details) | Per-instruction JSON `{ header, initiationDetail }` the maker/checker view and edit |
+| **Workflow** | Camunda `ESS_Payments_Document_Ingestion` | Orchestration per PDF upload — passes `uploadId` (= `fss_payment_upload_meta.id`), never OCR/LLM payloads |
 
 ---
 
@@ -55,1040 +48,1135 @@ This LLD translates the UX specification and ingestion design into implementable
 
 ```mermaid
 flowchart TB
-    subgraph UI["Portal — Instruction Upload tab"]
-        UP["Upload form: Country / Entity / metadata + file"]
-        TBL["Uploads table + detail modal"]
-    end
+  subgraph UI["Portal - ID Payments landing, new tab"]
+    UP["Upload form: Entity / Dept / Process / SubProcess / Activity / SubAct + file"]
+    TBL["Uploads table + detail modal"]
+  end
 
-    subgraph COMMON["IDP_Document_Ingestion.bpmn — SINGLE shared process"]
-        START(["IDP_Upload_Start"]) --> EXTRACT["Trigger_IDP_Extraction"]
-        EXTRACT --> WAIT{{"IDPExtractionCompleted"}}
-        WAIT --> GW1{"Extraction OK?"}
-        GW1 -->|fail| FAIL["End / FAILED"]
-        GW1 -->|success| MK{{"IDP_MakerReview"}}
-        MK --> CK{{"IDP_CheckerReview"}}
-        CK --> GW2{"idpApproved?"}
-        GW2 -->|reject| MK
-        GW2 -->|approve| TRIGGER["Trigger_IDP_Payment"]
-        TRIGGER --> END_IDP(["End"])
-    end
+  subgraph COMMON["ESS_Payments_Document_Ingestion.bpmn (file ESS_Payments_Document_Ingestion.bpmn) - SINGLE shared process"]
+    START(["Extraction_Upload_Start"]) --> EXTRACT["Trigger_Data_Extraction"]
+    EXTRACT --> GW1{"ExtractionResultGateway"}
+    GW1 -->|fail| CANCEL["CancelExtractionUpload (end)"]
+    GW1 -->|success| MK{"Extraction_MakerReview"}
+    MK --> GW0{"MakerDecisionGateway"}
+    GW0 -->|cancel, default| CANCEL
+    GW0 -->|submit| CK{"Extraction_CheckerReview"}
+    CK --> GW2{"ExtractionCheckerGateway"}
+    GW2 -->|reject| MK
+    GW2 -->|approve| TRIGGER["Trigger_Payment_From_Extraction"]
+    TRIGGER --> END_EXT(["Event_Extraction_End"])
+  end
 
-    subgraph ROUTE["Runtime routing — country / entity from upload row"]
-        REG["IDPPaymentRouteRegistry"]
-    end
+  subgraph ROUTE["Runtime routing — entity from upload row"]
+    REG["ExtractionPaymentRouteRegistry"]
+  end
+  
+  subgraph ID_PAY["IAP_ID_Payments.bpmn - PROD, additive only (proposed)"]
+    ID_START(["IAP_ID_Extraction_Trigger"]) --> ID_INIT["Initialize_IAP_From_Extraction"]
+    ID_INIT --> ID_ENR["Initialize_IAP_ID_Payments -> enrichment spine"]
+  end
 
-    subgraph ID_PAY["IAP_ID_Payments.bpmn — additive only"]
-        ID_START(["IAP_ID_IDP_Trigger"]) --> ID_INIT["Initialize_IAP_From_IDP"]
-        ID_INIT --> ID_ENR["Initialize_IAP_ID_Payments → enrichment spine"]
-    end
+  UP --> START
+  TRIGGER --> REG
+  REG -->|"entity=ID"| ID_START
+  TBL --> MK
+  TBL --> CK
 
-    subgraph CN_PAY["ChinaETF_TPlusN.bpmn — phase 2 example"]
-        CN_START(["CN_ETF_IDP_Trigger"]) --> CN_INIT["Initialize_CN_ETF_From_IDP"]
-        CN_INIT --> CN_ENR["Existing CN enrichment spine"]
-    end
-
-    UP --> START
-    TRIGGER --> REG
-    REG -->|"country=ID"| ID_START
-    REG -->|"country=CN, product=ETF"| CN_START
-    TBL --> MK
-    TBL --> CK
 ```
 
-**Principle:** OCR, LLM, extraction QC (IDP maker/checker), and upload persistence live **only** in `IDP_Document_Ingestion`. Payment enrichment, cut-off, S2B, and payment maker/checker stay in **existing country BPMNs** — unchanged except for one new message start + one init external task per country.
+**Principle:** OCR, LLM, extraction QC (maker/checker), and upload persistence live **only** in `ESS_Payments_Document_Ingestion`. Payment enrichment, cut-off, S2B, and payment maker/checker stay in `IAP_ID_Payments` — unchanged except for one new message start + one init external task. No BPMN messages are used inside `ESS_Payments_Document_Ingestion` (v3) — extraction result and maker Submit/Cancel are both plain exclusive-gateway decisions on process variables, evaluated the instant the preceding task completes.
 
 ### 2.2 Service interaction
 
 ```mermaid
 flowchart LR
-    UI["Portal UI"] --> GW["payment-gateway-service"]
-    GW --> WFM["workflow-management"]
-    GW --> IDP["idp-extraction-service"]
-    IDP --> GW
-    IDP --> WFM
-    WFM --> GW
-    GW --> CORE["payments-impl"]
-    GW --> MSG["fss_services_message"]
-    PUB["payment-publisher-service"] --> WFM
+  UI["Portal UI"] --> GW["payment-gateway-service"]
+  GW --> WFM["workflow-management"]
+  GW --> EXT["51786-idp-extraction-service"]
+  EXT --> GW
+  WFM --> GW
+  GW --> CORE["payments-impl (PaymentsCoreClient)"]
+  GW --> MSG["fss_services_message (MessageService)"]
+  PUB["payment-publisher-service"] --> WFM
+
 ```
 
 | Service | Responsibility |
-|---------|----------------|
-| `51786-payment-gateway-service` | `IDPUploadController` (meta + content tables), IDP external task workers, `Trigger_IDP_Payment` routing, `Initialize_*_From_IDP` handlers, internal content API for extraction |
-| `51786-idp-extraction-service` | OCR client, LLM structuring, `POST /v1/extract`, technical audit (`idp_extraction_audit`) — **no Camunda, no workflow client** |
-| `51786-workflow-management` | Deploy `IDP_Document_Ingestion.bpmn` + additive versions of country payment BPMNs |
-| `51786-document-service` | **Phase 2 only** — not invoked in Phase 1 |
-| `51786-payment-publisher-service` | No IDP changes in v1 (existing cut-off / status path after handoff) |
+| --- | --- |
+| `51786-payment-gateway-service` | `ExtractionUploadController` (meta + content tables), extraction external task workers, `Trigger_Payment_From_Extraction` routing, `IAPExtractionInitializeHandler`, internal content endpoint for extraction |
+| `51786-idp-extraction-service` | OCR client, LLM structuring, `POST /v1/extract`, `GET /v1/extract/{id}`, technical audit (`idp_extraction_audit`) — **already built, unchanged** |
+| `51786-workflow-management` | Deploy `ESS_Payments_Document_Ingestion.bpmn` (process id `ESS_Payments_Document_Ingestion`) + additive `IAP_ID_Payments.bpmn` |
+| `51786-document-service` | Phase 2 only — not invoked in phase 1 |
+| `51786-payment-publisher-service` | No changes in v1 — existing cut-off/status path runs unchanged after handoff |
 
-### 2.3 Orchestration boundary (critical)
+### 2.3 Orchestration boundary (unchanged principle, confirmed true in the built service)
 
-The extraction service is a **common capability** — reusable beyond payments. It must **not** depend on Camunda, payment domain tables, or workflow clients.
-
-| Responsibility | Owner |
-|----------------|--------|
-| `POST /v1/extract` — OCR + LLM + validate + audit | `51786-idp-extraction-service` |
-| Persist `fss_idp_upload`, `fss_idp_extraction_run`, maker payload | `51786-payment-gateway-service` |
-| Start / advance Camunda (`Trigger_IDP_Extraction`, complete task, correlate messages) | `51786-payment-gateway-service` |
-| `correlationId` on extract request | Opaque caller reference (e.g. `idpUploadId`) — extraction service does not interpret it |
+`51786-idp-extraction-service`'s own README states: *"No Camunda, payment orchestration, or workflow clients — callers (e.g. payment-gateway-service) own orchestration."* Confirmed in its `pom.xml` — no Camunda/workflow-client dependency present.
 
 ```mermaid
 sequenceDiagram
-    participant WFM as Camunda
+    participant WFM as Camunda (workflow-management)
     participant GW as payment-gateway-service
-    participant EXT as idp-extraction-service
+    participant EXT as 51786-idp-extraction-service
 
-    WFM->>GW: External task Trigger_IDP_Extraction
-    GW->>GW: Load blob, create extraction run row
-    GW->>EXT: POST /v1/extract (correlationId=idpUploadId)
-    EXT->>EXT: OCR → LLM → audit
-    EXT-->>GW: structured JSON + extractionId
-    GW->>GW: Save structured_output, overall_confidence
-    GW->>WFM: complete task + correlate IDPExtractionCompleted
-    Note over GW,WFM: Gateway owns workflow — extraction service never calls WorkflowService
+    WFM->>GW: External task Trigger_Data_Extraction
+    GW->>GW: Load blob; INSERT fss_payment_data_ingest_details rows (status=PROCESSING)
+    GW->>EXT: POST /v1/extract (correlationId=extractionUploadId)
+    EXT->>EXT: OCR -> LLM -> idp_extraction_audit
+    EXT->>GW: 200 structuredOutput+extractionId, OR 422 status=FAILED
+    GW->>GW: UPDATE ingest details: extracted_data, confidence_score, status=READY_FOR_REVIEW; sync meta.status
+    GW->>WFM: complete Trigger_Data_Extraction with extractionStatus (ExtractionResultGateway evaluates immediately - no wait/correlation step)
+    Note over GW,WFM: Gateway owns workflow - extraction service never calls WorkflowService
+
+```
+
+### 2.4 Extensibility design patterns (required for implementation)
+
+New **document types**, **payment entities**, and **LLM template changes** must be addable without modifying core orchestration code. Apply these patterns in `51786-payment-gateway-service`:
+
+| Pattern | Where | Purpose |
+|---------|-------|---------|
+| **Registry** | `ExtractionPaymentRouteRegistry`, `EntityExtractionTemplateRegistry` | Map `entity` → payment BPMN message + extraction `templateId` |
+| **Strategy** | `EntityPaymentMapper` (per entity) | Map `StoredExtractedData` POJO → `Payment` / `PaymentData` |
+| **Template method** | `AbstractExtractionExternalTaskHandler` | Shared Camunda lock/retry/complete; subclasses implement `doExecute` |
+| **Factory / resolver** | `EntityHandlerRegistry` | `resolve(entity)` → correct `EntityPaymentMapper` bean |
+| **Facade** | `ExtractionUploadActionService` | Single orchestration for DB + audit + WFM (all user actions) |
+| **Adapter** | `ExtractionServiceClient` | HTTP to `51786-idp-extraction-service`; returns typed `ExtractResponse` POJO |
+
+**Extension scenarios:**
+
+| Change | Touch points | Do **not** change |
+|--------|--------------|-------------------|
+| New payment entity (e.g. `CN`) | `application.yml` route row + new `CnEntityPaymentMapper` + BPMN message start on that entity's payment process | `ESS_Payments_Document_Ingestion.bpmn`, `ExtractionTriggerHandler` core loop |
+| New LLM template for entity | `entity-templates` config: `entity → templateId` passed in extract request metadata | Extraction service API (still `POST /v1/extract`) |
+| LLM JSON shape change for entity | New Jackson POJO package or versioned DTO under `model/extraction/{entity}/` + entity-specific mapper | DB schema (`extracted_data` stays CLOB) |
+| New upload file type (phase 2) | New `DocumentTypeHandler` strategy (`PdfDocumentTypeHandler`, future `XlsxDocumentTypeHandler`) | Meta/detail tables |
+
+```mermaid
+flowchart LR
+  UPLOAD["ExtractionUploadService"] --> WF["ESS_Payments_Document_Ingestion"]
+  WF --> H1["ExtractionTriggerHandler"]
+  H1 --> TREG["EntityExtractionTemplateRegistry"]
+  H1 --> EXT["ExtractionServiceClient"]
+  WF --> H2["ExtractionPaymentHandoffHandler"]
+  H2 --> RREG["ExtractionPaymentRouteRegistry"]
+  H2 --> MREG["EntityHandlerRegistry"]
+  MREG --> M1["IdEntityPaymentMapper"]
+  MREG --> M2["Future CnEntityPaymentMapper"]
 ```
 
 ---
 
 ## 3. BPMN design
 
-### 3.1 Common process: `IDP_Document_Ingestion.bpmn`
+### 3.1 Common process: `ESS_Payments_Document_Ingestion.bpmn` (file `ESS_Payments_Document_Ingestion.bpmn`)
 
 | Attribute | Value |
-|-----------|-------|
-| Process ID | `IDP_Document_Ingestion` |
+| --- | --- |
+| Process ID | `ESS_Payments_Document_Ingestion` |
 | Executable | `true` |
 | Module | `51786-workflow-management` |
-| Country scope | **Global** — one definition for all countries |
+| Country scope | Global — one definition for all countries |
 
-#### Process variables (set at start / maintained through flow)
+#### Process variables
 
 | Variable | Type | Set by | Purpose |
-|----------|------|--------|---------|
-| `idpUploadId` | String | Upload REST | Business key; correlation id |
-| `country` | String | UI upload form | Routes payment handoff |
-| `entity` | String | UI (optional) | Legal entity / booking entity when distinct from country |
-| `deptId`, `processId`, `subProcessId`, `activityId`, `subActivityId` | String | UI metadata dropdowns | Passed to OCR/LLM context |
-| `paymentMaker`, `paymentChecker` | String | Config / upload | IDP user task assignees |
-| `idpStatus` | String | Extraction + handlers | `PROCESSING`, `READY_FOR_REVIEW`, `FAILED`, … |
-| `idpApproved` | Boolean | Checker complete task | Checker decision |
-| `extractionRunId` | String | Extraction service | Latest run id (`is_latest=true`) |
-| `paymentTriggerMessage` | String | `Trigger_IDP_Payment` (optional audit) | Message name correlated |
+| --- | --- | --- | --- |
+| `extractionUploadId` | String | Upload REST | Business key; correlation id |
+| `entity` | String | UI upload form | **Routing key** — selects payment BPMN + LLM template (phase 1: `ID`) |
+| `deptId`, `processId`, `subProcessId`, `activityId`, `subActivityId` | String | UI metadata dropdowns | Passed to OCR/LLM `metadata` map |
+| `paymentMaker`, `paymentChecker` | String | Config / upload | Assignee expressions on `Extraction_MakerReview` / `Extraction_CheckerReview` |
+| `extractionStatus` | String | `ExtractionTriggerHandler` | `PROCESSING`, `READY_FOR_REVIEW`, `FAILED` — evaluated immediately by `ExtractionResultGateway` on task completion |
+| `makerAction` | String | Portal (maker Submit/Cancel button) | `SUBMIT` or `CANCEL` — evaluated immediately by `MakerDecisionGateway` on task completion |
+| `extractionApproved` | Boolean | Checker complete task | Checker decision |
 
 #### Task catalog
 
-| BPMN ID | Type | Topic / message | Handler |
-|---------|------|-----------------|---------|
-| `IDP_Upload_Start` | Start | REST `startWorkflow` after meta + content rows persisted | `IDPUploadService` |
-| `Trigger_IDP_Extraction` | External | `Trigger_IDP_Extraction` | `IDPTriggerExtractionHandler` |
-| `Event_IDPExtractionCompleted` | Intermediate catch | `IDPExtractionCompleted` | **payment-gateway-service** correlates after extract (Phase 1: immediately after sync HTTP; Phase 2: after poll/callback) |
-| `IDPExtractionGateway` | Exclusive | `${idpStatus=='READY_FOR_REVIEW'}` | — |
-| `IDP_MakerReview` | User task | `${paymentMaker}` | Portal modal |
-| `IDP_CheckerReview` | User task | `${paymentChecker}` | Portal modal |
-| `IDPCheckerGateway` | Exclusive | `${idpApproved==true}` | — |
-| `Trigger_IDP_Payment` | External | `Trigger_IDP_Payment` | `IDPTriggerPaymentHandler` |
-| `Event_IDP_End` | End | — | — |
+| BPMN ID | Type | Topic / message | Handler (proposed) |
+| --- | --- | --- | --- |
+| `Extraction_Upload_Start` | Start | REST `startWorkflowProcess` after meta + content rows persisted | `ExtractionUploadService` |
+| `Trigger_Data_Extraction` | External | `Trigger_Data_Extraction` | `ExtractionTriggerHandler` |
+| `ExtractionResultGateway` | Exclusive | - evaluated immediately, no wait state | `${extractionStatus=='READY_FOR_REVIEW'}` (default: `CancelExtractionUpload`) |
+| `Extraction_MakerReview` | User task | `${paymentMaker}` | Portal modal |
+| `MakerDecisionGateway` | Exclusive | - evaluated immediately | `${makerAction=='SUBMIT'}` (default: `CancelExtractionUpload`) |
+| `Extraction_CheckerReview` | User task | `${paymentChecker}` | Portal modal |
+| `ExtractionCheckerGateway` | Exclusive | `${extractionApproved==true}` | — |
+| `Trigger_Payment_From_Extraction` | External | `Trigger_Payment_From_Extraction` | `ExtractionPaymentHandoffHandler` |
+| `Event_Extraction_End` | End | — | — |
+| `CancelExtractionUpload` | End | — | Reached from `ExtractionResultGateway` (fail) or `MakerDecisionGateway` (cancel); set status `CANCELLED`/`FAILED` accordingly |
 
-#### Boundary events
+#### No boundary events / no BPMN messages (v3)
 
-| Event | Message | Attached to | Action |
-|-------|---------|-------------|--------|
-| `CancelIDPUpload` | `CancelIDPUpload` | `IDP_MakerReview` | Set status `CANCELLED`; end or cancel path |
-| `IDPExtractionFailed` | `IDPExtractionFailed` | Extraction wait (optional) | Set status `FAILED` |
+There are **no boundary events and no `bpmn:message` definitions** in this process. `Event_ExtractionCompleted`, `ExtractionFailedBoundary`, and the message form of `CancelExtractionUpload` were removed — both `ExtractionResultGateway` and `MakerDecisionGateway` are plain exclusive gateways evaluated the instant the preceding external/user task completes.
 
-#### BPMN messages (IDP process only)
-
-| Message | Producer | Consumer |
-|---------|----------|----------|
-| `IDPExtractionCompleted` | **payment-gateway-service** (`IDPTriggerExtractionHandler` or async worker) | `Event_IDPExtractionCompleted` |
-| `IDPExtractionFailed` | **payment-gateway-service** | Boundary (optional) |
-| `CancelIDPUpload` | Upload cancel API | Boundary on maker review |
-
-**Important:** `IDP_Document_Ingestion` does **not** define `IAP_ID_IDP_Trigger` or any country payment messages — those belong to country payment BPMNs.
-
-### 3.2 Country payment BPMN — additive pattern (template)
-
-Apply the **same additive diff** to each country payment process when IDP is enabled for that country.
-
-#### Indonesia — `IAP_ID_Payments.bpmn` (phase 1)
+### 3.2 Entity payment BPMN — additive pattern (template, proposal against real `IAP_ID_Payments.bpmn`)
 
 | Addition | Detail |
-|----------|--------|
-| Message start | `IAP_ID_IDP_Trigger` (message `IAP_ID_IDP_Trigger`) |
-| External task | `Initialize_IAP_From_IDP` (topic `Initialize_IAP_From_IDP`) |
-| Merge | `Initialize_IAP_From_IDP` → `Initialize_IAP_ID_Payments` (3rd incoming) |
-| Annotation | *"Triggered from IDP_Document_Ingestion via Trigger_IDP_Payment when country=ID"* |
+| --- | --- |
+| Message start | `IAP_ID_Extraction_Trigger` |
+| External task | `Initialize_IAP_From_Extraction` (topic `Initialize_IAP_From_Extraction`) |
+| Merge | `Initialize_IAP_From_Extraction` -> `Initialize_IAP_ID_Payments` (3rd incoming, alongside the 2 existing: `SequenceFlow_1e0z7n9`, `Flow_0af90pb`) |
+| Annotation | *"Triggered from ESS_Payments_Document_Ingestion via Trigger_Payment_From_Extraction when entity=ID"* |
 
-Existing paths **frozen:** `IAP_ID_AutomatedTrigger`, `IAP_ID_BulkTrigger`, `IAP_ID_Manual_Payment` — no edits to sequence flows, gateway expressions, or existing external task topics.
+Existing paths frozen: `IAP_ID_AutomatedTrigger`, `IAP_ID_BulkTrigger`, `IAP_ID_Manual_Payment` — no edits to sequence flows, gateway expressions, or existing topics (see [Design doc §3](https://www.google.com/search?q=./IDP_Document_Ingestion_Design.md%233-production-safety--what-must-not-change)).
 
-#### China ETF — `ChinaETF_TPlusN.bpmn` (phase 2 example)
-
-| Addition | Detail |
-|----------|--------|
-| Message start | `CN_ETF_IDP_Trigger` |
-| External task | `Initialize_CN_ETF_From_IDP` |
-| Merge | Into existing CN enrichment entry (equivalent of `Initialize_IAP_ID_Payments`) |
-
-Same pattern for `ChinaETF_TplusZero` if product requires separate process.
-
-### 3.3 Handoff flow (`Trigger_IDP_Payment`)
+### 3.3 Handoff flow (`Trigger_Payment_From_Extraction`)
 
 ```mermaid
 sequenceDiagram
-    participant CK as IDP Checker (UI)
+    participant CK as Extraction Checker (UI)
     participant GW as payment-gateway-service
-    participant REG as IDPPaymentRouteRegistry
-    participant WFM as Camunda engine
+    participant REG as ExtractionPaymentRouteRegistry
+    participant WFM as Camunda workflow-management
     participant PAY as IAP_ID_Payments instance
 
-    CK->>GW: Complete IDP_CheckerReview (approve)
-    WFM->>GW: External task Trigger_IDP_Payment
-    GW->>GW: Load fss_idp_upload by businessKey
-    GW->>GW: Assert payment_workflow_key IS NULL
-    GW->>REG: resolve(country, entity, metadata)
-    REG-->>GW: PaymentRoute(message=IAP_ID_IDP_Trigger, processKey=IAP_ID_Payments)
-    GW->>WFM: startMessageCorrelation(IAP_ID_IDP_Trigger, businessKey=idpUploadId, vars)
-    WFM->>PAY: New instance → Initialize_IAP_From_IDP
-    GW->>GW: Update payment_workflow_key, upload_status=APPROVED
-    GW->>WFM: Complete Trigger_IDP_Payment
+    CK->>GW: POST .../approve?uploadId={id} (gateway façade — DB + audit + WFM)
+    WFM->>GW: External task Trigger_Payment_From_Extraction
+    GW->>GW: Load fss_payment_upload_meta + ingest details by uploadId
+    GW->>GW: Assert no detail has message_id set (idempotency)
+    loop For each fss_payment_data_ingest_details row
+      GW->>GW: Map detail.extracted_data -> Payment/PaymentData
+      GW->>GW: MessageService.save(channel=DOC_EXTRACTION) -> messageId
+      GW->>GW: UPDATE detail: message_id, payment_workflow_key, status=APPROVED
+      GW->>REG: resolve(entity)
+      REG->>GW: Route(message=IAP_ID_Extraction_Trigger, processKey=IAP_ID_Payments)
+      GW->>WFM: startMessageCorrelation(IAP_ID_Extraction_Trigger, businessKey=messageId, vars incl. instructionIndex=i)
+      WFM->>PAY: New instance (businessKey=messageId) -> Initialize_IAP_From_Extraction
+    end
+    GW->>GW: Update fss_payment_upload_meta: status=APPROVED, processed_at
+    GW->>WFM: Complete Trigger_Payment_From_Extraction
+
 ```
 
-#### Correlation payload (minimum)
+**Why `businessKey=messageId`, not `extractionUploadId`:** the real, already-built `IAP_ID_Payments` convention keys every process instance by `messageId` (confirmed: `IAPIDPaymentsMessageHandler.buildWorkflowReqObj(messageId)`, and downstream handlers resolve the payment record via `PaymentProcessing.getPaymentRecord(businessKey)` — see [IAP_ID_Payments.md](https://www.google.com/search?q=../IAP_ID_Payments.md)). Reusing `extractionUploadId` as the new instance's business key would silently break that convention (Cockpit search, reconciliation, any downstream `getPaymentRecord` lookup). So the `fss_services_message` row (and its `messageId`) is created **before** correlation, not inside `Initialize_IAP_From_Extraction` — see `ExtractionPaymentHandoffHandler` (§9.3).
 
-| Variable | Value |
-|----------|-------|
-| `idpUploadId` | Upload PK |
-| `extractionRunId` | Latest `is_latest=true` extraction run |
-| `country` | From upload row |
-| `entity` | From upload row |
-| `channel` | `IDP_UPLOAD` |
-| `idpApproved` | `true` |
-| `isApproved` | `true` (bulk-like skip of payment checker when validation clean) |
-| `isRepaired` | `false` |
-| `paymentMaker` / `paymentChecker` | From upload / config |
-| `messageId` | If pre-created on `fss_services_message` |
+#### Correlation payload
+
+See [Design doc §6.2](https://www.google.com/search?q=./IDP_Document_Ingestion_Design.md%2362-variables-passed-at-correlation) — uses the **real** `IAP_ID_Payments` variable names (`isApproved`, `isRepaired`), not invented ones.
 
 #### Idempotency
 
-1. Before correlate: `SELECT payment_workflow_key FROM fss_idp_upload WHERE idp_upload_id = ?` — abort if non-null.
-2. On success: store child process instance id in `payment_workflow_key`.
-3. Double approve → single payment instance.
+1. Before handoff loop: abort if any `fss_payment_data_ingest_details` row for `upload_id` already has `message_id` set.
+2. Each detail row stores `message_id` and `payment_workflow_key` (= `message_id`) after successful correlation.
+3. `upload_id` (`fss_payment_upload_meta.id`) is the `ESS_Payments_Document_Ingestion` business key; each `message_id` is the payment instance business key (see §3.3).
+4. Double approve → no duplicate correlations (`message_id` guard per detail row).
 
 ---
 
-## 4. Country / entity routing
+## 4. Entity routing & template config
 
-> **Cross-reference:** [IDP_Document_Ingestion_Design.md §2.1](./IDP_Document_Ingestion_Design.md#21-country--payment-routing-responsibilities) (same model, design-review wording).
+### 4.0 Routing responsibilities
 
-### 4.0 Routing responsibilities (who decides what)
+`ESS_Payments_Document_Ingestion.bpmn` decides only ingestion-internal gateways. **Payment BPMN selection** and **LLM template selection** are config-driven from `entity` on the upload row.
 
-`IDP_Document_Ingestion.bpmn` is a decision engine for **IDP QC only** (`IDPExtractionGateway`, `IDPCheckerGateway`). It does **not** branch by country. `Trigger_IDP_Payment` is one external-task step — not a country-routing gateway.
+> **Correction (v7):** `country` and `entity` are the same concept in this platform. Use **`entity` only** — no separate `country` column, process variable, or registry dimension.
 
-| Layer | Owns country routing? | Responsibility |
-|-------|----------------------|----------------|
-| `IDP_Document_Ingestion.bpmn` | **No** | Common upload → extract → IDP maker/checker for all countries. Ends after `Trigger_IDP_Payment` completes. |
-| Country payment BPMN | **Defines entry only** | Message start + `Initialize_*_From_IDP` per country (`IAP_ID_IDP_Trigger`, `CN_ETF_IDP_Trigger`, …). Names are BPMN/deploy contracts. |
-| `IDPPaymentRouteRegistry` | **Yes — selection** | Config maps `country` / `entity` from `fss_idp_upload` → `messageName` + `processDefinitionKey`. |
-| `IDPTriggerPaymentHandler` | **Executes** | Registry lookup + `startMessageCorrelation` — no scattered `if (country.equals(...))` in handler code. |
+| Layer | Responsibility |
+|-------|----------------|
+| Upload form / meta row | `entity` = routing key (phase 1: `ID` for Indonesia) |
+| `EntityExtractionTemplateRegistry` | `entity` → `templateId` for `POST /v1/extract` (phase 1: `ID` → `id-payment-v1`) |
+| `ExtractionPaymentRouteRegistry` | `entity` → payment message + process key |
+| `EntityHandlerRegistry` | `entity` → `EntityPaymentMapper` implementation |
 
-Adding a country: (1) additive message start on that country's payment BPMN, (2) one registry row. **No change** to `IDP_Document_Ingestion.bpmn`.
+### 4.1 `application.yml` configuration
 
-### 4.1 `IDPPaymentRouteRegistry` (Java)
+**Proposed location:** `51786-payment-gateway-service/src/main/resources/application.yml`
 
-Config-driven registry — **no country logic inside BPMN**.
+```yaml
+extraction:
+  payment-routes:
+    - entity: ID
+      message-name: IAP_ID_Extraction_Trigger
+      process-definition-key: IAP_ID_Payments
+      initialize-topic: Initialize_IAP_From_Extraction
+  entity-templates:
+    - entity: ID
+      template-id: id-payment-v1
+  upload:
+    enabled: true
+    max-file-size-mb: 50
+```
+
+**Adding a new entity (checklist):**
+
+1. Add row to `extraction.payment-routes` and `extraction.entity-templates`.
+2. Implement `EntityPaymentMapper` (e.g. `CnEntityPaymentMapper`) and register as Spring bean.
+3. Deploy message start + init external task on that entity's payment BPMN.
+4. Add LLM template in extraction service (if new JSON shape → new Jackson POJO package).
+
+### 4.2 Java interfaces & config binding
 
 ```java
-// Conceptual — payment-gateway-service
-public record PaymentRoute(
-    String messageName,      // e.g. IAP_ID_IDP_Trigger
-    String processDefinitionKey, // e.g. IAP_ID_Payments
-    String initializeTopic     // e.g. Initialize_IAP_From_IDP — for validation/docs
+// com.sc.fss.paymentgateway.config.extraction.ExtractionRouteProperties
+@ConfigurationProperties(prefix = "extraction")
+public class ExtractionProperties {
+    private List<PaymentRouteEntry> paymentRoutes = List.of();
+    private List<EntityTemplateEntry> entityTemplates = List.of();
+    private UploadProperties upload = new UploadProperties();
+    // getters/setters
+}
+
+public record PaymentRouteEntry(
+    String entity,
+    String messageName,
+    String processDefinitionKey,
+    String initializeTopic
 ) {}
 
-public interface IDPPaymentRouteRegistry {
-    PaymentRoute resolve(String country, String entity,
-                         String processId, String subProcessId);
+public record EntityTemplateEntry(String entity, String templateId) {}
+```
+
+```java
+// com.sc.fss.paymentgateway.service.extraction.routing
+public interface ExtractionPaymentRouteRegistry {
+    PaymentRouteEntry resolve(String entity);
+}
+
+@Component
+public class YamlExtractionPaymentRouteRegistry implements ExtractionPaymentRouteRegistry {
+    private final Map<String, PaymentRouteEntry> byEntity;
+
+    public YamlExtractionPaymentRouteRegistry(ExtractionProperties props) {
+        this.byEntity = props.getPaymentRoutes().stream()
+            .collect(Collectors.toUnmodifiableMap(
+                e -> e.entity().toUpperCase(Locale.ROOT),
+                Function.identity(),
+                (a, b) -> { throw new IllegalStateException("Duplicate entity: " + a.entity()); }));
+    }
+
+    @Override
+    public PaymentRouteEntry resolve(String entity) {
+        return Optional.ofNullable(byEntity.get(entity.toUpperCase(Locale.ROOT)))
+            .orElseThrow(() -> new UnknownEntityException(entity));
+    }
 }
 ```
 
-#### Phase 1 registry entries
+```java
+public interface EntityExtractionTemplateRegistry {
+    String resolveTemplateId(String entity);
+}
 
-| country | entity | processId (optional) | messageName | processDefinitionKey | initializeTopic |
-|---------|--------|----------------------|-------------|----------------------|-----------------|
-| `ID` | * | * | `IAP_ID_IDP_Trigger` | `IAP_ID_Payments` | `Initialize_IAP_From_IDP` |
-
-#### Phase 2 stubs (config only — no BPMN deploy until ready)
-
-| country | entity | messageName | processDefinitionKey |
-|---------|--------|-------------|----------------------|
-| `CN` | `ETF` | `CN_ETF_IDP_Trigger` | `ChinaETF_TPlusN` |
-| `CN` | `ETF_T0` | `CN_ETF_T0_IDP_Trigger` | `ChinaETF_TplusZero` |
-
-**Resolution order:** exact match `(country, entity, processId, subProcessId)` → `(country, entity)` → `(country, *)` → error with clear ops message.
-
-Store routes in `application.yml` or DB table `fss_idp_payment_route` (see §5) for runtime changes without redeploy.
-
-### 4.2 UI country / entity selection
-
-From [IDP_UX_Design.md](./IDP_UX_Design.md) upload zone:
-
-```
-Country [ID]  Dept ▼  Process ▼  SubProcess ▼  Activity ▼  SubAct ▼
+@Component
+public class YamlEntityExtractionTemplateRegistry implements EntityExtractionTemplateRegistry {
+  // same Map pattern as route registry
+}
 ```
 
-| UI field | DB column | Workflow variable | Routing use |
-|----------|-----------|-------------------|-------------|
-| Country | `country` | `country` | Primary route key |
-| Dept / Process / … | `dept_id`, … | same | OCR context + optional route refinement |
-| Entity (if separate dropdown added) | `entity` | `entity` | Secondary route key |
+**Reuse scan:** mirror `CountrySpecificProcessorFactory` / `CountryExcelMsgProcessorFactory` wiring — see [IDP_LLD_REPO_SCAN_PROMPT.md](./IDP_LLD_REPO_SCAN_PROMPT.md).
 
-For ID v1, country defaults to `ID` on ID payments landing; multi-country portal can expose country picker later using the same tab component.
+### 4.3 UI entity selection
+
+See [UX doc §2.4](./IDP_UX_Design.md). On the ID landing page, `entity` defaults to `ID` (hidden or read-only until multi-entity tabs exist).
 
 ---
 
-## 5. Database design
+## 5. Database design (manual SQL, no Liquibase)
 
-### 5.1 New tables
+**No migration tool (Liquibase/Flyway) exists anywhere in this codebase today.** DDL is delivered as **plain, manually-run `.sql` scripts**.
 
-#### `fss_idp_upload` (metadata only)
+**Proposed location:** `51786-payment-gateway-service/src/main/resources/sql/manual-ddl/`
 
-| Column | Type | Null | Notes |
-|--------|------|------|-------|
-| `idp_upload_id` | VARCHAR(36) | N | PK, UUID, Camunda business key |
-| `batch_id` | VARCHAR(36) | Y | Optional multi-doc batch |
-| `file_name` | VARCHAR(255) | N | |
-| `content_type` | VARCHAR(100) | Y | MIME type |
-| `file_size` | BIGINT | Y | Size in bytes — kept on meta row for list/detail without joining blob |
-| `country` | VARCHAR(10) | N | Route key — **not hardcoded ID in schema** |
-| `entity` | VARCHAR(50) | Y | Legal / booking entity |
-| `dept_id` | VARCHAR(50) | Y | |
-| `process_id` | VARCHAR(50) | Y | |
-| `sub_process_id` | VARCHAR(50) | Y | |
-| `activity_id` | VARCHAR(50) | Y | |
-| `sub_activity_id` | VARCHAR(50) | Y | |
-| `upload_status` | VARCHAR(30) | N | See §5.4 |
-| `idp_workflow_key` | VARCHAR(100) | Y | IDP process instance id |
-| `payment_workflow_key` | VARCHAR(100) | Y | Country payment instance id after handoff |
-| `payment_trigger_message` | VARCHAR(100) | Y | Audited message name from registry |
-| `payment_id` | VARCHAR(36) | Y | After `Save_Payment_Transaction` |
-| `message_id` | VARCHAR(36) | Y | `fss_services_message` link |
-| `uploaded_by` | VARCHAR(100) | N | |
-| `uploaded_timestamp` | TIMESTAMP | N | Table sort: DESC |
-| `approved_by` | VARCHAR(100) | Y | IDP checker |
-| `approved_timestamp` | TIMESTAMP | Y | |
-| `remarks` | VARCHAR(500) | Y | Reject / cancel reason |
-| `created_by` | VARCHAR(100) | N | Audit |
-| `created_timestamp` | TIMESTAMP | N | |
-| `updated_by` | VARCHAR(100) | Y | |
-| `updated_timestamp` | TIMESTAMP | Y | |
+```
+V1__fss_payment_upload_content.sql
+V2__fss_payment_upload_meta.sql
+V3__fss_payment_data_ingest_details.sql
+V4__fss_payment_upload_audit.sql
+```
 
-**Indexes:**
+### 5.1 Three-table model
 
-- `idx_idp_upload_status_ts` on (`upload_status`, `uploaded_timestamp` DESC)
-- `idx_idp_upload_country_ts` on (`country`, `uploaded_timestamp` DESC)
-- `idx_idp_upload_user` on (`uploaded_by`, `uploaded_timestamp` DESC)
-- `uq_idp_payment_workflow` on (`payment_workflow_key`) WHERE `payment_workflow_key IS NOT NULL` (optional — idempotency)
+The ingestion pipeline uses **three tables** with clear separation of concerns:
 
-#### `fss_idp_upload_content` (blob — 1:1 with upload)
-
-| Column | Type | Null | Notes |
-|--------|------|------|-------|
-| `idp_upload_id` | VARCHAR(36) | N | PK, FK → `fss_idp_upload` |
-| `file_content` | BLOB | N | Uploaded bytes |
-| `created_timestamp` | TIMESTAMP | N | |
-
-**Why split:** Keeps list/detail/workflow queries off the BLOB column. In Java, `IdpUploadEntity` has **no** `@Lob` field; content is loaded only via `IdpUploadContentRepository.findById(idpUploadId)` when the extraction pipeline needs it.
-
-#### `fss_idp_extraction_run`
-
-| Column | Type | Null | Notes |
-|--------|------|------|-------|
-| `extraction_run_id` | VARCHAR(36) | N | PK |
-| `idp_upload_id` | VARCHAR(36) | N | FK → `fss_idp_upload` |
-| `extraction_token` | VARCHAR(512) | Y | OCR API token |
-| `ocr_job_id` | VARCHAR(100) | Y | External OCR id |
-| `run_status` | VARCHAR(30) | N | PENDING, OCR_IN_PROGRESS, LLM_IN_PROGRESS, READY_FOR_REVIEW, FAILED |
-| `ocr_response_payload` | CLOB | Y | Retention policy applies |
-| `llm_response_payload` | CLOB | Y | |
-| `structured_output` | CLOB | Y | Target: [../after_ocr-llm-output.json](../after_ocr-llm-output.json) — includes per-field `Confidence` |
-| `overall_confidence` | DECIMAL(5,2) | Y | Document-level score 0–100; see §5.6 |
-| `error_code` | VARCHAR(50) | Y | |
-| `error_description` | VARCHAR(500) | Y | |
-| `retry_count` | INT | N | Default 0 |
-| `is_latest` | BOOLEAN | N | Default true; false on re-extract |
-| `started_timestamp` | TIMESTAMP | Y | |
-| `completed_timestamp` | TIMESTAMP | Y | |
-| `created_timestamp` | TIMESTAMP | N | |
-
-**Indexes:**
-
-- `idx_idp_run_upload` on (`idp_upload_id`, `is_latest`)
-- `idx_idp_run_status` on (`run_status`)
-
-#### `fss_idp_extracted_field` (recommended for modal PATCH)
-
-| Column | Type | Null | Notes |
-|--------|------|------|-------|
-| `field_id` | BIGINT | N | PK, identity |
-| `extraction_run_id` | VARCHAR(36) | N | FK |
-| `section` | VARCHAR(50) | N | HEADER, TRANSACTION, DEBIT, CREDIT |
-| `leg_index` | INT | Y | 0-based leg |
-| `field_name` | VARCHAR(100) | N | |
-| `field_value` | VARCHAR(500) | Y | |
-| `confidence` | DECIMAL(5,2) | Y | Per-field context confidence 0–100 from LLM; preserved when flattening from `structured_output` |
-| `is_edited` | BOOLEAN | N | Default false |
-| `edited_by` | VARCHAR(100) | Y | |
-| `edited_timestamp` | TIMESTAMP | Y | |
-
-**Indexes:** `idx_idp_field_run` on (`extraction_run_id`, `section`, `leg_index`)
-
-#### `fss_idp_upload_audit` (recommended)
-
-| Column | Type | Null | Notes |
-|--------|------|------|-------|
-| `audit_id` | BIGINT | N | PK |
-| `idp_upload_id` | VARCHAR(36) | N | |
-| `action` | VARCHAR(50) | N | UPLOAD, EXTRACT_COMPLETE, MAKER_SUBMIT, CHECKER_APPROVE, PAYMENT_TRIGGERED, … |
-| `actor` | VARCHAR(100) | Y | |
-| `details` | CLOB | Y | JSON snippet |
-| `timestamp` | TIMESTAMP | N | |
-
-#### `fss_idp_payment_route` (optional — alternative to YAML)
-
-| Column | Type | Notes |
-|--------|------|-------|
-| `route_id` | BIGINT PK | |
-| `country` | VARCHAR(10) | |
-| `entity` | VARCHAR(50) | Nullable = wildcard |
-| `process_id` | VARCHAR(50) | Optional filter |
-| `sub_process_id` | VARCHAR(50) | Optional |
-| `message_name` | VARCHAR(100) | e.g. `IAP_ID_IDP_Trigger` |
-| `process_definition_key` | VARCHAR(100) | |
-| `initialize_topic` | VARCHAR(100) | |
-| `is_active` | BOOLEAN | |
-| `priority` | INT | Higher wins on match |
-
-### 5.2 Existing tables (usage)
-
-| Table | Usage |
-|-------|-------|
-| `fss_services_message` | `channel = IDP_UPLOAD`; enriched Payment after `Initialize_*_From_IDP` |
-| `fss_payment_txns` | No schema change; row created by existing `Save_Payment_Transaction` |
-| `fss_serv_batch` | Optional `batch_id` on upload |
-| `act_*` | Camunda state for IDP + payment instances |
-
-### 5.3 ER diagram
+| Table | Granularity | Role |
+|-------|-------------|------|
+| `fss_payment_upload_content` | Per file | BLOB storage only — never joined in list queries |
+| `fss_payment_upload_meta` | Per PDF | File metadata, upload audit fields, file-level `status`, FK to content |
+| `fss_payment_data_ingest_details` | Per instruction | One row per `initiationDetail` — extraction result, per-instruction lifecycle, payment handoff keys, `retry`, `error_desc` |
 
 ```mermaid
 erDiagram
-    fss_idp_upload ||--|| fss_idp_upload_content : stores
-    fss_idp_upload ||--o{ fss_idp_extraction_run : has
-    fss_idp_extraction_run ||--o{ fss_idp_extracted_field : contains
-    fss_idp_upload ||--o{ fss_idp_upload_audit : audited_by
-    fss_idp_upload ||--o| fss_services_message : creates
-    fss_idp_upload ||--o| fss_payment_txns : results_in
-    fss_idp_payment_route ||..o{ fss_idp_upload : routes
+    fss_payment_upload_content ||--o| fss_payment_upload_meta : "file_content_id"
+    fss_payment_upload_meta ||--o{ fss_payment_data_ingest_details : "upload_id"
+    fss_payment_data_ingest_details ||--o| fss_services_message : "message_id"
+    fss_payment_data_ingest_details ||--o| fss_payment_txns : "via message"
 ```
 
-### 5.4 Upload status lifecycle
+**Relationships (from schema diagram):**
 
-| Status | Set by | UI table | Row clickable |
-|--------|--------|----------|---------------|
-| `UPLOADED` | Insert on REST | — | No |
-| `PROCESSING` | After start workflow | Processing | No |
-| `READY_FOR_REVIEW` | Extraction complete | Ready review | Yes (maker) |
-| `SUBMITTED` | Maker submit | With checker | Yes |
-| `REJECTED` | Checker reject | Rejected | Yes (maker) |
-| `APPROVED` | Handoff triggered | Approved | Yes (read-only) |
-| `COMPLETED` | Payment completed | Completed | Yes |
-| `FAILED` | Extraction fail | Failed | Yes |
-| `CANCELLED` | Maker cancel | Cancelled | Optional |
+- `fss_payment_upload_meta.file_content_id` → `fss_payment_upload_content.id` (many meta rows could theoretically share content; in practice 1:1 per PDF upload).
+- `fss_payment_data_ingest_details.upload_id` → `fss_payment_upload_meta.id` (**1:N** — one PDF upload produces N detail rows when the LLM returns N instructions).
+- Camunda `ESS_Payments_Document_Ingestion` business key = `fss_payment_upload_meta.id` (`uploadId`).
+- Each detail row's `payment_workflow_key` / `message_id` = `IAP_ID_Payments` business key after handoff.
 
-Map `upload_status` ↔ `idpStatus` process variable on every transition.
+---
 
-### 5.5 DDL sketch (Oracle / generic)
+#### `fss_payment_upload_content` (BLOB — isolated)
+
+| Column | Type | Null | Notes |
+| --- | --- | --- | --- |
+| `id` | VARCHAR2(36) | N | PK, UUID |
+| `file_content` | BLOB | N | PDF bytes |
+
+---
+
+#### `fss_payment_upload_meta` (per PDF file)
+
+| Column | Type | Null | Notes |
+| --- | --- | --- | --- |
+| `id` | VARCHAR2(36) | N | PK, UUID; **Camunda business key** for `ESS_Payments_Document_Ingestion` |
+| `batch_id` | VARCHAR2(36) | Y | Shared by all PDFs extracted from one ZIP upload |
+| `file_name` | VARCHAR2(255) | N | Original PDF file name |
+| `entity` | VARCHAR2(50) | N | **Routing key** — phase 1: `ID`; selects payment BPMN + LLM template |
+| `dept_id` | VARCHAR2(50) | Y | Upload metadata |
+| `process_id` | VARCHAR2(50) | Y | Upload metadata |
+| `sub_process_id` | VARCHAR2(50) | Y | Upload metadata |
+| `activity_id` | VARCHAR2(50) | Y | Upload metadata |
+| `sub_activity_id` | VARCHAR2(50) | Y | Upload metadata |
+| `status` | VARCHAR2(30) | N | File-level lifecycle — see §5.4; aggregate of child detail statuses |
+| `file_content_id` | VARCHAR2(36) | N | FK → `fss_payment_upload_content.id` |
+| `uploaded_by` | VARCHAR2(100) | N | |
+| `uploaded_at` | TIMESTAMP | N | Sort key (DESC) |
+| `processed_at` | TIMESTAMP | Y | Set when all details reach terminal state |
+| `remarks` | VARCHAR2(500) | Y | Last reject/cancel reason (also in audit) |
+| `approved_by` | VARCHAR2(100) | Y | Extraction checker (on approve) |
+| `approved_at` | TIMESTAMP | Y | On checker approve |
+
+**Indexes:** `idx_payment_upload_meta_entity` (`entity`), `idx_payment_upload_meta_batch` (`batch_id`), `idx_payment_upload_meta_status_ts` (`status`, `uploaded_at` DESC), `idx_payment_upload_meta_user` (`uploaded_by`, `uploaded_at` DESC).
+
+---
+
+#### `fss_payment_data_ingest_details` (per instruction — core pipeline row)
+
+| Column | Type | Null | Notes |
+| --- | --- | --- | --- |
+| `id` | VARCHAR2(36) | N | PK, UUID |
+| `upload_id` | VARCHAR2(36) | N | FK → `fss_payment_upload_meta.id` |
+| `instruction_index` | NUMBER(5) | N | 0-based position in LLM `initiationDetail[]` |
+| `status` | VARCHAR2(30) | N | Per-instruction lifecycle — see §5.4 |
+| `extraction_id` | VARCHAR2(36) | Y | `extractionId` from `51786-idp-extraction-service` (shared across details from same OCR pass) |
+| `extracted_data` | CLOB | Y | Per-instruction JSON: `{ "header": {…}, "initiationDetail": {…} }` — maker edits merged in place |
+| `confidence_score` | NUMBER(5,2) | Y | From `initiationDetail.Confidence1` (parsed double) |
+| `tx_ref` | VARCHAR2(50) | Y | Denormalized from `initiationDetail.TxRef` — list/sort without parsing CLOB |
+| `sub_activity_id` | VARCHAR2(50) | Y | Denormalized — e.g. `Redemption`, `Subscription` |
+| `activity_id` | VARCHAR2(10) | Y | Denormalized — e.g. `BT`, `OTT` |
+| `trn_typ` | VARCHAR2(50) | Y | Denormalized from `TransactionDetails.TrnTyp` |
+| `value_date` | DATE | Y | Denormalized from `TransactionDetails.ValDt` |
+| `client_name` | VARCHAR2(255) | Y | Denormalized from `TransactionDetails.ClntNm` |
+| `debit_amount` | VARCHAR2(50) | Y | Denormalized from first debit leg `DrAmt` (display only) |
+| `low_confidence_field_count` | NUMBER(5) | Y | Count of fields with `Confidence < 90` — drives ⚠ badge in UI |
+| `extraction_workflow_key` | VARCHAR2(36) | Y | = `upload_id` — ESS ingestion process business key |
+| `message_id` | VARCHAR2(36) | Y → **N after handoff** | **Mandatory link to `fss_services_message`** — created **before** `startMessageCorrelation`; becomes IAP business key. `NOT NULL` when `status IN (APPROVED, COMPLETED)` |
+| `payment_workflow_key` | VARCHAR2(36) | Y | = `message_id` after handoff (same convention as existing IAP handlers) |
+| `payment_id` | VARCHAR2(36) | Y | Backfilled from `MessageService.getMessage(message_id).getFuncId()` after `Save_Payment_Transaction` |
+| `handoff_at` | TIMESTAMP | Y | When `message_id` was saved and correlation succeeded |
+| `handoff_message_name` | VARCHAR2(100) | Y | e.g. `IAP_ID_Extraction_Trigger` — audited registry resolution |
+| `approved_by` | VARCHAR2(100) | Y | Extraction checker |
+| `approved_at` | TIMESTAMP | Y | |
+| `started_at` | TIMESTAMP | Y | Extraction/handoff attempt start |
+| `completed_at` | TIMESTAMP | Y | Terminal state reached |
+| `updated_by` | VARCHAR2(100) | Y | Last actor/handler |
+| `updated_at` | TIMESTAMP | Y | |
+| `retry` | NUMBER(5) | N | Default `0`; incremented on re-extract or retried handoff |
+| `error_desc` | VARCHAR2(500) | Y | Human-readable failure reason (extraction `422`, timeout, handoff error); cleared on re-extract |
+
+**Unique constraint:** `(upload_id, instruction_index)`.
+
+**Indexes:** `idx_ingest_details_upload` (`upload_id`), `idx_ingest_details_status` (`status`), `idx_ingest_details_message` (`message_id`).
+
+**Why one row per instruction:** each row is the **complete lifecycle record** for one `initiationDetail` → one `fss_services_message` → one `IAP_ID_Payments` instance. Do **not** deprecate `message_id` — it is the mandatory handoff anchor required by `ID_payments.bpmn` (business key = `messageId`). There is no separate handoff table; tracking lives on this row.
+
+**Handoff invariant (application-enforced):**
+
+```
+FOR each detail WHERE status transitions to APPROVED:
+  1. MessageService.save(channel=DOC_EXTRACTION) → message_id  (REQUIRED)
+  2. UPDATE detail SET message_id, payment_workflow_key=message_id, handoff_at, handoff_message_name
+  3. startMessageCorrelation(..., businessKey=message_id)
+  4. Abort if message_id IS NULL before correlate
+```
+
+Partial handoff: details that already have `message_id` are skipped on retry; details without `message_id` are retried. `retry` + `error_desc` capture per-instruction failures.
+
+**`retry` / `error_desc` usage:**
+
+| Scenario | `retry` | `error_desc` |
+| --- | --- | --- |
+| Extraction fails (HTTP 422) | unchanged | OCR/LLM error from extraction service |
+| Extraction timeout (exhausted Camunda retries) | unchanged | e.g. `OCR_TIMEOUT` |
+| Re-extract requested | `retry + 1` | cleared |
+| Handoff correlate fails | `retry + 1` | correlation error message |
+| Success | unchanged | cleared |
+
+---
+
+### 5.2 Existing tables (usage only, no schema change)
+
+| Table | Usage |
+|---|---|
+| `fss_services_message` | `channel='DOC_EXTRACTION'`; one row **per ingest detail** at handoff |
+| `fss_payment_txns` | No schema change; row created by existing `Save_Payment_Transaction` |
+| `act_*` | Camunda engine state — new process definitions only |
+
+### 5.3 Status lifecycle
+
+**File-level (`fss_payment_upload_meta.status`)** — derived/synced from child details:
+
+| Status | Meaning |
+| --- | --- |
+| `UPLOADED` | Meta row inserted; workflow not yet started |
+| `PROCESSING` | `ESS_Payments_Document_Ingestion` running extraction |
+| `READY_FOR_REVIEW` | All details extracted; maker can review |
+| `SUBMITTED` | Maker submitted to checker |
+| `HANDOFF_IN_PROGRESS` | Checker approved; `Trigger_Payment_From_Extraction` running |
+| `REJECTED` | Checker rejected (any detail or whole upload) |
+| `APPROVED` | All details correlated; handoff complete |
+| `COMPLETED` | All details reached payment completion |
+| `FAILED` | Extraction failed for all details / unrecoverable |
+| `CANCELLED` | Maker cancelled |
+
+**Per-instruction (`fss_payment_data_ingest_details.status`)** — same vocabulary; each detail row transitions independently after handoff:
+
+| Status | Set by | Notes |
+| --- | --- | --- |
+| `UPLOADED` | Row inserted (placeholder before extract) | Transient |
+| `PROCESSING` | Extraction in flight | |
+| `READY_FOR_REVIEW` | Extract complete for this instruction | Maker editable |
+| `SUBMITTED` | Maker submit | |
+| `REJECTED` | Checker reject | Loops to maker |
+| `HANDOFF_IN_PROGRESS` | Checker approve (transient) | Until `message_id` saved per detail |
+| `APPROVED` | Handoff correlated for this instruction | |
+| `COMPLETED` | Payment workflow completed | |
+| `FAILED` | Extraction or handoff failed | `error_desc` populated |
+| `CANCELLED` | Maker cancel | |
+
+### 5.4 DDL (Oracle — manual scripts)
 
 ```sql
-CREATE TABLE fss_idp_upload (
-    idp_upload_id        VARCHAR2(36)  PRIMARY KEY,
-    batch_id             VARCHAR2(36),
-    file_name            VARCHAR2(255) NOT NULL,
-    content_type         VARCHAR2(100),
-    file_size            NUMBER(19),
-    country              VARCHAR2(10)  NOT NULL,
-    entity               VARCHAR2(50),
-    dept_id              VARCHAR2(50),
-    process_id           VARCHAR2(50),
-    sub_process_id       VARCHAR2(50),
-    activity_id          VARCHAR2(50),
-    sub_activity_id      VARCHAR2(50),
-    upload_status        VARCHAR2(30)  NOT NULL,
-    idp_workflow_key     VARCHAR2(100),
-    payment_workflow_key VARCHAR2(100),
-    payment_trigger_message VARCHAR2(100),
-    payment_id           VARCHAR2(36),
-    message_id           VARCHAR2(36),
-    uploaded_by          VARCHAR2(100) NOT NULL,
-    uploaded_timestamp   TIMESTAMP     NOT NULL,
-    approved_by          VARCHAR2(100),
-    approved_timestamp   TIMESTAMP,
-    remarks              VARCHAR2(500),
-    created_by           VARCHAR2(100) NOT NULL,
-    created_timestamp    TIMESTAMP     NOT NULL,
-    updated_by           VARCHAR2(100),
-    updated_timestamp    TIMESTAMP
+-- V1__fss_payment_upload_content.sql
+CREATE TABLE fss_payment_upload_content (
+    id              VARCHAR2(36) PRIMARY KEY,
+    file_content    BLOB         NOT NULL
 );
 
-CREATE TABLE fss_idp_upload_content (
-    idp_upload_id        VARCHAR2(36)  PRIMARY KEY REFERENCES fss_idp_upload(idp_upload_id),
-    file_content         BLOB          NOT NULL,
-    created_timestamp    TIMESTAMP     NOT NULL
+-- V2__fss_payment_upload_meta.sql
+CREATE TABLE fss_payment_upload_meta (
+    id              VARCHAR2(36) PRIMARY KEY,
+    batch_id        VARCHAR2(36),
+    file_name       VARCHAR2(255) NOT NULL,
+    entity          VARCHAR2(50) NOT NULL,
+    dept_id         VARCHAR2(50),
+    process_id      VARCHAR2(50),
+    sub_process_id  VARCHAR2(50),
+    activity_id     VARCHAR2(50),
+    sub_activity_id VARCHAR2(50),
+    status          VARCHAR2(30) NOT NULL,
+    file_content_id VARCHAR2(36) NOT NULL REFERENCES fss_payment_upload_content(id),
+    uploaded_by     VARCHAR2(100) NOT NULL,
+    uploaded_at     TIMESTAMP    NOT NULL,
+    processed_at    TIMESTAMP,
+    remarks         VARCHAR2(500),
+    approved_by     VARCHAR2(100),
+    approved_at     TIMESTAMP
 );
+CREATE INDEX idx_payment_upload_meta_entity ON fss_payment_upload_meta (entity);
+CREATE INDEX idx_payment_upload_meta_batch ON fss_payment_upload_meta (batch_id);
+CREATE INDEX idx_payment_upload_meta_status_ts ON fss_payment_upload_meta (status, uploaded_at DESC);
+CREATE INDEX idx_payment_upload_meta_user ON fss_payment_upload_meta (uploaded_by, uploaded_at DESC);
 
-CREATE TABLE fss_idp_extraction_run (
-    extraction_run_id    VARCHAR2(36)  PRIMARY KEY,
-    idp_upload_id        VARCHAR2(36)  NOT NULL REFERENCES fss_idp_upload(idp_upload_id),
-    extraction_token     VARCHAR2(512),
-    ocr_job_id           VARCHAR2(100),
-    run_status           VARCHAR2(30)  NOT NULL,
-    ocr_response_payload CLOB,
-    llm_response_payload CLOB,
-    structured_output    CLOB,
-    overall_confidence   NUMBER(5,2),
-    error_code           VARCHAR2(50),
-    error_description    VARCHAR2(500),
-    retry_count          NUMBER(5)     DEFAULT 0 NOT NULL,
-    is_latest            CHAR(1)       DEFAULT 'Y' NOT NULL,
-    started_timestamp    TIMESTAMP,
-    completed_timestamp  TIMESTAMP,
-    created_timestamp    TIMESTAMP     NOT NULL
+-- V3__fss_payment_data_ingest_details.sql
+CREATE TABLE fss_payment_data_ingest_details (
+    id                      VARCHAR2(36) PRIMARY KEY,
+    upload_id               VARCHAR2(36) NOT NULL REFERENCES fss_payment_upload_meta(id),
+    instruction_index       NUMBER(5)    NOT NULL,
+    status                  VARCHAR2(30) NOT NULL,
+    extraction_id           VARCHAR2(36),
+    extracted_data          CLOB,
+    confidence_score        NUMBER(5,2),
+    tx_ref                  VARCHAR2(50),
+    sub_activity_id         VARCHAR2(50),
+    activity_id             VARCHAR2(10),
+    trn_typ                 VARCHAR2(50),
+    value_date              DATE,
+    client_name             VARCHAR2(255),
+    debit_amount            VARCHAR2(50),
+    low_confidence_field_count NUMBER(5),
+    extraction_workflow_key VARCHAR2(36),
+    message_id              VARCHAR2(36),
+    payment_workflow_key    VARCHAR2(36),
+    payment_id              VARCHAR2(36),
+    handoff_at              TIMESTAMP,
+    handoff_message_name    VARCHAR2(100),
+    approved_by             VARCHAR2(100),
+    approved_at             TIMESTAMP,
+    started_at              TIMESTAMP,
+    completed_at            TIMESTAMP,
+    updated_by              VARCHAR2(100),
+    updated_at              TIMESTAMP,
+    retry                   NUMBER(5)    DEFAULT 0 NOT NULL,
+    error_desc              VARCHAR2(500),
+    CONSTRAINT uk_ingest_details_upload_idx UNIQUE (upload_id, instruction_index)
 );
+CREATE INDEX idx_ingest_details_upload ON fss_payment_data_ingest_details (upload_id);
+CREATE INDEX idx_ingest_details_status ON fss_payment_data_ingest_details (status);
+CREATE INDEX idx_ingest_details_message ON fss_payment_data_ingest_details (message_id);
+CREATE INDEX idx_ingest_details_sub_act ON fss_payment_data_ingest_details (upload_id, sub_activity_id);
+CREATE INDEX idx_ingest_details_trn_typ ON fss_payment_data_ingest_details (upload_id, trn_typ);
 
--- fss_idp_extracted_field, fss_idp_upload_audit, fss_idp_payment_route — same columns as §5.1
+-- V4__fss_payment_upload_audit.sql
+CREATE TABLE fss_payment_upload_audit (
+    audit_id        NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    upload_id       VARCHAR2(36) NOT NULL REFERENCES fss_payment_upload_meta(id),
+    action          VARCHAR2(50) NOT NULL,
+    actor           VARCHAR2(100),
+    before_status   VARCHAR2(30),
+    after_status    VARCHAR2(30),
+    remarks         VARCHAR2(500),
+    details         CLOB,
+    created_at      TIMESTAMP NOT NULL
+);
+CREATE INDEX idx_payment_upload_audit_upload ON fss_payment_upload_audit (upload_id, created_at DESC);
 ```
 
-### 5.6 Structured output & confidence scores
+**Audit `action` values:** `UPLOAD`, `EXTRACT_COMPLETE`, `EXTRACT_FAILED`, `MAKER_SUBMIT`, `MAKER_CANCEL`, `CHECKER_APPROVE`, `CHECKER_REJECT`, `RE_EXTRACT`, `HANDOFF_STARTED`, `HANDOFF_COMPLETE`, `HANDOFF_FAILED`, `WORKFLOW_ACTION_FAILED`.
 
-#### LLM output shape (required)
+#### Who writes audit?
 
-Every extracted field in `structured_output` must include a **context-based confidence** score (0–100). This matches the legacy ID payment screen and [../after_ocr-llm-output.json](../after_ocr-llm-output.json).
+| Event | Writer |
+| --- | --- |
+| Upload, re-extract | `ExtractionUploadService` |
+| Extraction complete/fail | `ExtractionTriggerHandler` |
+| Submit, cancel, approve, reject | **`ExtractionUploadActionService`** (before WFM call) |
+| Payment handoff | `ExtractionPaymentHandoffHandler` |
 
-| Location | Field | Type | Meaning |
-|----------|-------|------|---------|
-| `initiationDetail` | `Confidence1` | string/number | **Instruction-level** overall confidence from LLM |
-| `TransactionDetails[*]` | `Name`, `Value`, `Confidence` | object | Transaction attribute + per-field confidence |
-| `DebitDetails.details[*].data[*]` | `Name`, `Value`, `Confidence` | object | Debit leg field + confidence |
-| `CreditDetails.details[*].data[*]` | `Name`, `Value`, `Confidence` | object | Credit leg field + confidence |
+### 5.6 Why not a DB-backed route registry in v1
 
-Example field object:
+A `fss_payment_data_ingest_route` table (runtime-editable routing) is optional for phase 2. Ship the registry as a static `application.yml` list in `payment-gateway-service` first.
+
+---
+
+## 6. Structured output contract & JSON -> Payment mapping (corrected, real contract)
+
+**This section replaces the v1 "IDP Document Ingestion" mapping table**, which incorrectly assumed `TrnTyp`/`ClntNm`/`ValDt` were direct fields of `initiationDetail`. The **real**, already-built and tested output of `51786-idp-extraction-service` (`POST /v1/extract`, confirmed against `IdPaymentOutput`/`InitiationDetail`/`ExtractedField` Java records and the actual fixture `after_ocr-llm-output.json`) is documented below **verbatim**. See [README.md decision log item 2](https://www.google.com/search?q=./README.md%23decision-log) for why this contract is kept as-is rather than rewritten.
+
+### 6.1 Real response envelope (`POST /v1/extract`)
+
+On `status=COMPLETED`, the LLM returns **`structuredOutput` with `initiationDetail` array only** (no `header`). `ExtractionTriggerHandler` builds `header` once, then **INSERTs one `fss_payment_data_ingest_details` row per instruction** with `extracted_data = { header, initiationDetail: item[i] }`, `confidence_score`, `extraction_workflow_key = upload_id` — see [Design doc §6.3](./IDP_Document_Ingestion_Design.md#63-llm-output-vs-stored-extracted_data).
 
 ```json
 {
-  "Name": "TrnRef",
-  "Value": "IDPYRE015001",
-  "Confidence": "92.76"
+  "extractionId": "ext-audit-uuid",
+  "templateId": "id-payment-v1",
+  "correlationId": "extraction-upload-id",
+  "status": "COMPLETED",
+  "structuredOutput": { "...": "see 6.2" },
+  "ocrTraceId": "ocr-job-id",
+  "processingTimeMs": 45230,
+  "errorCode": null,
+  "errorDescription": null
+}
+
+```
+
+`status` is one of `PENDING`, `OCR_IN_PROGRESS`, `LLM_IN_PROGRESS`, `COMPLETED`, `FAILED` (`JobStatus` enum, confirmed). On `FAILED`, the HTTP status is **422**, not 200 — see [Design doc § 4.4.1](https://www.google.com/search?q=./IDP_Document_Ingestion_Design.md%23441-how-the-gateway-knows-extraction-is-done-and-the-real-http-status-contract).
+
+### 6.2 Real `structuredOutput` shape (verbatim, confirmed against the built fixture)
+
+```json
+{
+  "header": {
+    "uniqueId": "3897122",
+    "country": "SS_ID_DOC",
+    "project_version": "1.0.0",
+    "request_timestamp": "03022026212204",
+    "response_timestamp": "03022026212212",
+    "job_id": "JID-549a5d3a-0103-11f1-9107-9e5a5da3c310",
+    "doc_ids": ["C0AA239C-0000-CD1F-8C11-408513E7F19F"],
+    "ErrorCode": "200",
+    "ErrorDescription": "",
+    "TotInst": "1",
+    "InstructionSummary": [
+      { "DeptId": "FundServices", "ProcessId": "Cash", "SubProcessId": "CI", "NoInst1": "1" }
+    ]
+  },
+  "initiationDetail": [
+    {
+      "TxRef": "3897122-001",
+    "DocRef": "page1",
+    "DocId": "C0AA239C-0000-CD1F-8C11-408513E7F19F",
+    "DocName": "3897122.pdf",
+    "DeptId": "FundServices",
+    "ProcessId": "Cash",
+    "SubProcessId": "CI",
+    "ActivityId": "BT",
+    "SubActivityId": "Redemption",
+    "function": "NEWM",
+    "Lang": "Eng",
+    "Confidence1": "97.23",
+    "TransactionDetails": [
+      { "Name": "BankChg", "Value": "No", "Confidence": "94.07" },
+      { "Name": "Multi", "Value": "No", "Confidence": "92.78" },
+      { "Name": "NonS2B", "Value": "No", "Confidence": "94.36" },
+      { "Name": "TrnRef", "Value": "IDPYRE015001", "Confidence": "92.76" },
+      { "Name": "ScaRef", "Value": "", "Confidence": "0" },
+      { "Name": "TrnTyp", "Value": "Redemption", "Confidence": "94.69" },
+      { "Name": "ClntNm", "Value": "PT BNI ASSET MANAGEMENT", "Confidence": "93.23" },
+      { "Name": "ValDt", "Value": "2025-10-29", "Confidence": "94.0" }
+    ],
+    "DebitDetails": {
+      "summary": "1",
+      "details": [{ "data": [
+        { "Name": "Transaction-Id", "Value": "Txn-1", "Confidence": "96.48" },
+        { "Name": "DrAccCcy", "Value": "IDR", "Confidence": "97.19" },
+        { "Name": "DrAccNo", "Value": "30681655612", "Confidence": "92.58" },
+        { "Name": "DrAccNm", "Value": "", "Confidence": "0" },
+        { "Name": "DrAmt", "Value": "5000000000", "Confidence": "95.7" },
+        { "Name": "DrNarrLn1", "Value": "Redemption", "Confidence": "93.13" }
+      ]}]
+    },
+    "CreditDetails": {
+      "summary": "1",
+      "details": [{ "data": [
+        { "Name": "Transaction-Id", "Value": "Txn-1", "Confidence": "92.94" },
+        { "Name": "CrAccCcy", "Value": "IDR", "Confidence": "95.19" },
+        { "Name": "CrAccNo", "Value": "30608788756", "Confidence": "94.95" },
+        { "Name": "CrAccNm", "Value": "", "Confidence": "0" },
+        { "Name": "CrAmt", "Value": "5000000000", "Confidence": "94.38" },
+        { "Name": "CrNarrLn1", "Value": "Redemption", "Confidence": "93.8" }
+      ]}]
+    }
+    }
+  ]
 }
 ```
 
-**LLM prompt rules** (`51786-idp-extraction-service` template `id-payment-v1/system.st`):
+**Stored shape** (after gateway merges header): `{ "header": { ... }, "initiationDetail": [ ... ] }`. Single-instruction PDFs use an array of length 1.
 
-1. Emit `Confidence` for **every** field in `TransactionDetails`, `DebitDetails`, and `CreditDetails`.
-2. Use `0` when the field is absent or cannot be determined from the document context.
-3. Confidence reflects how strongly the value is supported by OCR text and document context (not OCR engine score alone).
-4. Emit `initiationDetail.Confidence1` as the overall instruction confidence.
+**Key facts (all confirmed against real code, not assumed):**
 
-**Java template:** `ExtractedField` (`Name`, `Value`, `Confidence`); `InitiationDetail.confidence1` → `Confidence1`.
+* LLM output is **`initiationDetail[]` only**; `header` is built by `ExtractionTriggerHandler` from OCR/job context (`uniqueId`, `TotInst` = array length, `InstructionSummary`, `doc_ids`, …).
+* `header` has 11 fields, including a per-instruction `InstructionSummary[]` array — none of these map to `Payment`, they are OCR/LLM job metadata only, except `doc_ids[0]` (document linkage) and `uniqueId` (external ref candidate).
+* `initiationDetail` has **no** direct `TrnTyp`/`ClntNm`/`ValDt`/`TrnRef` fields. Every business field except `TxRef`/`DocRef`/`DocId`/`DocName`/`DeptId`/`ProcessId`/`SubProcessId`/`ActivityId`/`SubActivityId`/`function`/`Lang`/`Confidence1` lives inside `TransactionDetails[]`, `DebitDetails.details[].data[]`, or `CreditDetails.details[].data[]` as `{ "Name", "Value", "Confidence" }` triples.
+* `Confidence` (and `Confidence1`) are **JSON strings**, e.g. `"94.07"` — not numbers. Any comparison (e.g. "highlight if `Confidence < 90`") must `Double.parseDouble(...)` first.
+* `DebitDetails`/`CreditDetails` share the same `LegDetails { summary, details[] }` shape; `details[].data[]` is the actual field list per leg (supports future multi-leg payments even though phase 1 uses a single leg each).
+* **Maker edits** are merged into `fss_payment_data_ingest_details.extracted_data` in place (per instruction row) via `POST .../fields`.
 
-#### `overall_confidence` column (extraction run row)
+### 6.2.1 `TransactionDetails[]` known `Name` catalog (from the real fixture — treat as the confirmed baseline; the LLM may omit fields it cannot find, never add undocumented ones without updating this table)
 
-Denormalized on `fss_idp_extraction_run` for list views and sorting without parsing CLOB.
+| `Name` | Meaning | Maps to |
+| --- | --- | --- |
+| `BankChg` | Bank charges indicator (Yes/No) | Payment charge-bearer flag |
+| `Multi` | Multi-transaction indicator | Payment attribute |
+| `NonS2B` | Non-S2B indicator | Payment attribute |
+| `TrnRef` | Transaction reference | Payment attribute (distinct from `initiationDetail.TxRef`) |
+| `ScaRef` | SCA reference | Payment attribute (may be empty/`Confidence:"0"` when not present) |
+| `TrnTyp` | **Transaction type** | `Payment.transactionType` |
+| `ClntNm` | **Client name** | `Payment.clientName` |
+| `ValDt` | **Value date** (`YYYY-MM-DD`) | `Payment.valueDate` |
+
+### 6.2.2 `DebitDetails.details[].data[]` / `CreditDetails.details[].data[]` known `Name` catalog
+
+| `Name` | Meaning | Maps to |
+| --- | --- | --- |
+| `Transaction-Id` | Leg correlation id within the instruction | Debit/credit leg key |
+| `DrAccCcy` / `CrAccCcy` | Account currency | Leg currency |
+| `DrAccNo` / `CrAccNo` | Account number | Leg account number |
+| `DrAccNm` / `CrAccNm` | Account name (often blank, `Confidence:"0"`, pending enrichment) | Leg account name |
+| `DrAmt` / `CrAmt` | Amount | Leg amount |
+| `DrNarrLn1` / `CrNarrLn1` | Narration line 1 | Leg narration |
+
+### 6.3 Jackson POJO model & entity mappers (no `Map.get()` in v1)
+
+**Rule:** Deserialize `extracted_data` CLOB and extraction HTTP responses with **Jackson POJOs**. Do not use `Map<String,Object>`, `JsonNode.get()`, or stringly-typed field lookup in production mapping code.
+
+#### 6.3.1 Reuse extraction-service types (do not duplicate)
+
+Import from `51786-idp-extraction-service` (scan repo for exact package): `ExtractResponse`, `InitiationDetail`, `ExtractedField`.
+
+Gateway storage wrapper: `StoredExtractedData { ExtractionHeader header; InitiationDetail initiationDetail; }` — serialized via `ExtractedDataCodec` + injected `ObjectMapper`.
+
+When an entity's LLM template changes, add versioned POJOs (e.g. `model.extraction.id.v2`) + new `EntityPaymentMapper`.
+
+#### 6.3.2 `EntityPaymentMapper` strategy
+
+```java
+public interface EntityPaymentMapper {
+    String entity();
+    Payment mapToPayment(StoredExtractedData extracted, PaymentUploadMetaEntity meta);
+    PaymentData mapToPaymentData(StoredExtractedData extracted, PaymentUploadMetaEntity meta);
+}
+```
+
+`EntityHandlerRegistry` collects all `EntityPaymentMapper` Spring beans by `entity()` code. `ExtractionPaymentHandoffHandler` calls `require(meta.getEntity())`.
+
+`Payment`/`PaymentData` from `com.sc.fssservices.model.transaction.*` — mirror `IAPPaymentBulkTransactionHandler` leg-building (scan repo).
+
+#### 6.3.3 Typed helpers (optional)
+
+`InitiationDetailSupport.transactionDetailValue(detail, "TrnTyp")` streams `List<ExtractedField>` — not `Map.get()`.
+
+#### 6.3.4 Denormalized columns
+
+Populate `tx_ref`, `trn_typ`, etc. from POJO getters in `ExtractionTriggerHandler`.
+
+### 6.4 `confidence_score` (on `fss_payment_data_ingest_details`)
 
 | Source | Rule |
-|--------|------|
-| Primary | `initiationDetail.Confidence1` from LLM structured output |
-| Fallback | Minimum of all per-field `Confidence` values in `structured_output` |
-| After maker edit | Unchanged unless business rule recalculates; edited fields set `is_edited=true` in `fss_idp_extracted_field` |
+| --- | --- |
+| Primary | `initiationDetail.Confidence1` on each detail row, parsed as double |
+| Meta aggregate | `MIN(confidence_score)` across details for upload list display |
+| Fallback | Minimum of all per-field `Confidence` values in `extracted_data` |
+| After maker edit | Unchanged; edited fields get `isEdited` metadata inside `extracted_data` |
 
-Populated when persisting the run after `POST /v1/extract` returns.
+### 6.5 Maker review & confidence
 
-#### Maker review & confidence
-
-- Maker **edits field values** in the review payload (`PATCH /uploads/{id}/fields`).
-- On save: update `structured_output` and/or `fss_idp_extracted_field` for the current run (`is_latest=true`).
-- **Original** LLM `Confidence` is retained for audit.
-- UI highlights fields where `Confidence < 90` (configurable threshold).
-
-#### Extraction service audit (`idp_extraction_audit`)
-
-Technical trace only (OCR raw, LLM raw). Gateway `fss_idp_extraction_run` is the **business** record used by portal and payment handoff.
+* Maker edits **field values** only (`PATCH /v1/extraction-uploads/{id}/fields`, see API Reference).
+* Original LLM `Confidence` is retained for audit regardless of edits.
+* UI highlights fields where the **parsed** `Confidence < 90` (configurable threshold, plain constant in v1 — no feature-flag config system, see §8).
 
 ---
 
-## 6. REST API design
+## 7. Error handling & resilience
 
-> **Full API reference:** [IDP_API_Reference.md](./IDP_API_Reference.md) — request/response examples, UI action map, extraction service contract.
+| Layer | Strategy |
+| --- | --- |
+| Extraction HTTP call | `ExtractionTriggerHandler` branches explicitly: `200` -> success, `422` -> permanent fail (no retry), timeout/5xx -> retry via the same `ExternalTaskHelper.getRetries`/`getNextTimeout` pattern every other `IAP_ID_Payments` handler already uses ([IAP_ID_Payments.md](https://www.google.com/search?q=../IAP_ID_Payments.md) §5) |
+| Handoff | If correlate fails, do **not** complete `Trigger_Payment_From_Extraction`; upload stays `SUBMITTED`/`APPROVED`-pending; ops alert |
+| Extraction retry | `retry` on `fss_payment_data_ingest_details`; re-extract increments `retry`, clears `extracted_data`/`error_desc`, resets `status=PROCESSING` on all detail rows for the upload |
+| Stuck uploads | Reconciliation scheduler in the gateway (below) |
+| Payment gateways | Existing `IAP_ID_Payments` behavior after handoff — no changes |
 
-Base path: `/v1/idp` (gateway-service). Auth: existing portal JWT + `paymentMaker` / `paymentChecker` groups.
+### 7.1 Reconciliation scheduler (gateway, new)
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/uploads` | Multipart upload + metadata; inserts meta + content rows; starts `IDP_Document_Ingestion` |
-| `GET` | `/uploads` | List with `sort=recent`, filters: `status`, `country`, `myUploads` |
-| `GET` | `/uploads/{id}` | Detail for modal (meta + latest extraction run + fields; **no** blob) |
-| `GET` | `/internal/uploads/{id}/content` | **Internal** — streams blob from `fss_idp_upload_content` for idp-extraction-service |
-| `PATCH` | `/uploads/{id}/fields` | Maker save draft |
-| `POST` | `/uploads/{id}/re-extract` | New extraction run; upload → `PROCESSING` |
-| `POST` | `/workflow/complete` | Existing generic complete — maker submit, checker approve/reject, cancel |
+| Condition | Action |
+| --- | --- |
+| `status=PROCESSING` on meta with details still `PROCESSING` after timeout | Mark details `FAILED`, set `error_desc`; sync meta `FAILED` |
+| Detail `status=APPROVED` AND `message_id IS NOT NULL` AND payment not complete | Backfill from `MessageService.getMessage(message_id)` |
 
-### 6.1 `POST /v1/idp/uploads` request
+### 7.2 Idempotency keys
 
-```json
-{
-  "country": "ID",
-  "entity": null,
-  "deptId": "FundServices",
-  "processId": "Cash",
-  "subProcessId": "CI",
-  "activityId": "BT",
-  "subActivityId": "Redemption"
-}
-```
-
-Multipart: `file` (PDF/image).
-
-### 6.2 `POST /v1/idp/uploads` response
-
-```json
-{
-  "idpUploadId": "a1b2c3d4-...",
-  "uploadStatus": "PROCESSING",
-  "idpWorkflowKey": "..."
-}
-```
-
-### 6.3 List response row
-
-```json
-{
-  "idpUploadId": "...",
-  "fileName": "3897122.pdf",
-  "uploadedTimestamp": "2026-07-30T10:22:00Z",
-  "uploadStatus": "READY_FOR_REVIEW",
-  "overallConfidence": 97.23,
-  "uploadedBy": "you",
-  "paymentRef": null,
-  "country": "ID"
-}
-```
+`uploadId` (`fss_payment_upload_meta.id`) — Camunda business key. Before re-extracting, check `idp_extraction_audit` for `correlation_id=uploadId` and `job_status=COMPLETED`.
 
 ---
 
-## 7. Code implementation strategy
+## 8. Feature flag — none in v1
 
-### 7.1 Module layout
+No feature-flag framework exists anywhere in `51786-transaction-data-tiles` today (confirmed — no LaunchDarkly, no config-toggle pattern). Building one just for this feature is out of scope. Rollout is controlled by:
+
+1. Deploying all backend pieces (§P1–P5 in [Design doc §11](https://www.google.com/search?q=./IDP_Document_Ingestion_Design.md%2311-deployment-plan)) and verifying end-to-end in a lower environment **before** merging the UI tab.
+2. The new tab and upload form are only usable by users in the `paymentMaker`/`paymentChecker` candidate groups already configured for `IAP_ID_Payments` — no separate access control needed.
+3. If a kill-switch is required later, the simplest option consistent with this codebase's existing config style is a single `application.properties` boolean read once at controller startup (`extraction-upload.enabled=true|false`) returning `404`/disabling the route — not a runtime-toggleable flag service.
+
+---
+
+## 9. Java implementation guide
+
+> **Before coding:** run [IDP_LLD_REPO_SCAN_PROMPT.md](./IDP_LLD_REPO_SCAN_PROMPT.md) in the active workspace and fill §13.2 with findings.
+
+### 9.1 Module layout
 
 ```
 51786-payment-gateway-service/
-  src/main/java/.../idp/
-    controller/IDPUploadController.java
-    service/
-      IDPUploadService.java
-      IdpUploadContentService.java
-      IDPFieldService.java
-      IDPPaymentRouteRegistry.java (+ YamlPaymentRouteRegistry)
-    workflow/handler/idp/
-      IDPTriggerExtractionHandler.java
-      IDPTriggerPaymentHandler.java
+  src/main/java/com/sc/fss/paymentgateway/
+    config/extraction/
+      ExtractionProperties.java              // @ConfigurationProperties("extraction")
+      ExtractionAutoConfiguration.java       // enable config props
+    controller/
+      ExtractionUploadController.java
+    client/
+      ExtractionServiceClient.java           // Feign/RestTemplate → POST /v1/extract
+    service/ingestion/
+      ExtractionUploadService.java
+      ExtractionUploadActionService.java
+      ExtractionUploadContentService.java
+      ExtractionUploadAuditService.java
+      ExtractedDataCodec.java / JacksonExtractedDataCodec.java
+    service/extraction/routing/
+      ExtractionPaymentRouteRegistry.java
+      YamlExtractionPaymentRouteRegistry.java
+      EntityExtractionTemplateRegistry.java
+      YamlEntityExtractionTemplateRegistry.java
+      EntityHandlerRegistry.java
+    service/extraction/mapper/
+      EntityPaymentMapper.java
+      IdEntityPaymentMapper.java             // phase 1
+    service/extraction/support/
+      InitiationDetailSupport.java
+    workflow/handler/extraction/
+      AbstractExtractionExternalTaskHandler.java
+      ExtractionTriggerHandler.java
+      ExtractionPaymentHandoffHandler.java
     workflow/handler/iap/id/
-      IAPIDPInitializeHandler.java      // topic Initialize_IAP_From_IDP
-    mapper/
-      IDPStructuredOutputMapper.java    // JSON → Payment / fields
-    model/entity/
-      IdpUploadEntity.java              // metadata only — no @Lob
-      IdpUploadContentEntity.java       // blob table — separate persistence unit path
-      IdpExtractionRunEntity.java
-      IdpExtractedFieldEntity.java
-    repository/
-      IdpUploadRepository.java
-      IdpUploadContentRepository.java
-      IdpExtractionRunRepository.java
-
-51786-idp-extraction-service/   (NEW)
-  src/main/java/.../
-    client/OcrApiClient.java
-    client/LlmStructuringClient.java
-    client/IdpUploadContentClient.java
-    service/ExtractionPipelineService.java
-    service/ExtractionCorrelationService.java
-    model/entity/ExtractionAuditEntity.java
-    service/audit/ExtractionAuditService.java
-
-51786-workflow-management/
-  src/main/resources/
-    IDP_Document_Ingestion.bpmn
-    IAP_ID_Payments.bpmn          // additive v(N+1)
+      IAPExtractionInitializeHandler.java
+    model/entity/ingestion/
+      PaymentUploadContentEntity.java
+      PaymentUploadMetaEntity.java
+      PaymentDataIngestDetailsEntity.java
+      PaymentUploadAuditEntity.java
+    model/extraction/
+      StoredExtractedData.java
+      ExtractionHeader.java
+    repository/ingestion/
+      PaymentUploadContentRepository.java
+      PaymentUploadMetaRepository.java
+      PaymentDataIngestDetailsRepository.java
+      PaymentUploadAuditRepository.java
 ```
 
-### 7.2 Implementation patterns (align with [../ID_payments.md](../ID_payments.md))
+### 9.2 Camunda external task implementation
+
+Follow the **same pattern** as existing IAP handlers in `51786-payment-gateway-service` (scan: `@ExternalTaskSubscription`, `ExternalTaskHandler`, `ExternalTaskHelper`).
+
+#### Base template (new — factor shared logic)
+
+```java
+@Slf4j
+public abstract class AbstractExtractionExternalTaskHandler implements ExternalTaskHandler {
+
+    protected abstract String topic();
+
+    protected abstract void doExecute(ExternalTask task, ExternalTaskService service) throws Exception;
+
+    @Override
+    public void execute(ExternalTask externalTask, ExternalTaskService externalTaskService) {
+        String businessKey = externalTask.getBusinessKey();
+        try {
+            doExecute(externalTask, externalTaskService);
+        } catch (PermanentFailureException e) {
+            log.warn("Permanent fail topic={} key={}: {}", topic(), businessKey, e.getMessage());
+            externalTaskService.handleFailure(externalTask, e.getMessage(), null,
+                0, 0L); // no retry — mirrors 422 extraction path
+        } catch (Exception e) {
+            int retries = ExternalTaskHelper.getRetries(externalTask); // reuse existing helper
+            long timeout = ExternalTaskHelper.getNextTimeout(externalTask);
+            externalTaskService.handleFailure(externalTask, e.getMessage(),
+                ExceptionUtils.getStackTrace(e), retries, timeout);
+        }
+    }
+
+    protected void complete(ExternalTask task, ExternalTaskService service, Map<String, Object> variables) {
+        service.complete(task, variables);
+    }
+
+    protected String requireVariable(ExternalTask task, String name) {
+        return Optional.ofNullable(task.getVariable(name))
+            .map(Object::toString)
+            .orElseThrow(() -> new IllegalStateException("Missing variable: " + name));
+    }
+}
+```
+
+#### Handler inventory
+
+| Class | `@ExternalTaskSubscription` topic | Extends | Completes with variables |
+|-------|-----------------------------------|---------|--------------------------|
+| `ExtractionTriggerHandler` | `Trigger_Data_Extraction` | `AbstractExtractionExternalTaskHandler` | `extractionStatus` = `READY_FOR_REVIEW` \| `FAILED` |
+| `ExtractionPaymentHandoffHandler` | `Trigger_Payment_From_Extraction` | `AbstractExtractionExternalTaskHandler` | none (empty map) |
+| `IAPExtractionInitializeHandler` | `Initialize_IAP_From_Extraction` | existing IAP base if present | per IAP convention |
+
+**Registration:** Spring component scan — same as other `@ExternalTaskSubscription` beans; Camunda client polls topics automatically. **No** changes to `workflow-management` Java for external task workers (workers live in gateway).
+
+**workflow-management changes:** deploy BPMN only (`ESS_Payments_Document_Ingestion.bpmn`, additive `IAP_ID_Payments.bpmn`).
+
+### 9.3 Interface & class inventory
+
+| Type | Name | Responsibility |
+|------|------|----------------|
+| REST | `ExtractionUploadController` | Upload, list, detail, fields, re-extract, `performAction` |
+| Service | `ExtractionUploadService` | Persist meta/content, start workflow |
+| Service | `ExtractionUploadActionService` | `performAction(UploadAction, …)` — audit + DB + WFM |
+| Service | `ExtractionUploadAuditService` | Insert audit rows |
+| Service | `ExtractionUploadContentService` | BLOB load/store |
+| Client | `ExtractionServiceClient` | Typed `ExtractResponse extract(ExtractRequest)` |
+| Codec | `ExtractedDataCodec` | CLOB ↔ `StoredExtractedData` |
+| Registry | `ExtractionPaymentRouteRegistry` | `entity` → route |
+| Registry | `EntityExtractionTemplateRegistry` | `entity` → `templateId` |
+| Registry | `EntityHandlerRegistry` | `entity` → `EntityPaymentMapper` |
+| Strategy | `EntityPaymentMapper` | POJO → `Payment` / `PaymentData` |
+| Handler | `ExtractionTriggerHandler` | External: extraction |
+| Handler | `ExtractionPaymentHandoffHandler` | External: handoff loop |
+| Handler | `IAPExtractionInitializeHandler` | External: IAP init |
+| Enum | `UploadAction` | `SUBMIT`, `CANCEL`, `APPROVE`, `REJECT` |
+| Enum | `UploadStatus` | Mirrors §5.3 |
+| Exception | `UnknownEntityException`, `InvalidUploadTransitionException` | 400/404 mapping |
+
+### 9.4 `ExtractionUploadActionService` — single entry (switch inside service)
+
+```java
+public enum UploadAction { SUBMIT, CANCEL, APPROVE, REJECT }
+
+public interface ExtractionUploadActionService {
+    UploadActionResult performAction(String uploadId, UploadAction action,
+        Optional<String> remarks, String actor);
+}
+
+@Service
+@Transactional
+public class ExtractionUploadActionServiceImpl implements ExtractionUploadActionService {
+
+    private final Map<UploadAction, UploadActionHandler> handlers;
+
+    public ExtractionUploadActionServiceImpl(List<UploadActionHandler> handlerList) {
+        this.handlers = handlerList.stream()
+            .collect(Collectors.toUnmodifiableMap(UploadActionHandler::action, Function.identity()));
+    }
+
+    @Override
+    public UploadActionResult performAction(String uploadId, UploadAction action,
+            Optional<String> remarks, String actor) {
+        return handlers.get(action).execute(uploadId, remarks, actor);
+    }
+}
+
+public interface UploadActionHandler {
+    UploadAction action();
+    UploadActionResult execute(String uploadId, Optional<String> remarks, String actor);
+}
+```
+
+REST: `POST .../performAction?uploadId={id}` body `{ "action": "SUBMIT", "remarks": "..." }` — see [API Reference](./IDP_API_Reference.md) (four separate paths also valid; service layer stays unified).
+
+### 9.5 Java language features (use what parent POM allows)
+
+| Feature | Where to use |
+|---------|--------------|
+| **Java 8** `Optional`, `Stream`, `Collectors.toUnmodifiableMap` | Registries, null-safe variable read |
+| **Java 11** `var` (local only), `String.isBlank()` | Handler internals |
+| **Java 17** `record` | `PaymentRouteEntry`, `EntityTemplateEntry`, DTO responses if POM ≥17 |
+| **Generics** | `UploadActionHandler`, `EntityPaymentMapper`, repository `JpaRepository<Entity, String>` |
+| **Sealed interfaces** (17+) | Optional: `sealed interface UploadActionHandler permits SubmitHandler, …` |
+| **@ConfigurationProperties** | Type-safe `application.yml` binding — not manual `Environment.getProperty` |
+
+Do not use reflection-based plugin loading in v1 — Spring `List<EntityPaymentMapper>` injection is sufficient.
+
+### 9.6 Implementation patterns
 
 | Pattern | Application |
-|---------|-------------|
-| External task workers | All IDP service tasks use `@ExternalTaskSubscription` + `ExternalTaskHelper` retry — same as `IAPPaymentTransactionHandler` |
-| Message correlation | `WorkflowService.startMessageCorrelation` for handoff and extraction complete |
-| Payment enrichment | **No** IDP logic in enrichment chain — only `Initialize_*_From_IDP` builds `Message.enrichedMessage` |
-| Process variables | Booleans for gateways (`idpApproved`); strings `"true"`/`"false"` for payment gateways after handoff — match existing IAP conventions |
-| Human tasks | Portal completes via generic `/v1/workflow/complete` — not country-specific Java |
+| --- | --- |
+| External task workers | `@ExternalTaskSubscription` + extend `AbstractExtractionExternalTaskHandler` |
+| Message correlation | `WorkflowService.startMessageCorrelation(...)` — same as `IAPIDPaymentsMessageHandler` |
+| Human tasks | Gateway `performAction` only — never portal → WFM |
+| JSON | Jackson POJOs via `ExtractedDataCodec` + extraction service types |
+| Routing | `entity` only — `YamlExtractionPaymentRouteRegistry` |
 
-### 7.3 Key class responsibilities
+### 9.7 Key class responsibilities
 
-#### `IDPUploadService`
+#### `ExtractionUploadService`
 
-1. Validate file type / size.
-2. Insert `fss_idp_upload` metadata row (`UPLOADED`).
-3. Insert `fss_idp_upload_content` with `file_content` (same transaction).
-4. Call `WorkflowService.startWorkflow` with `processKey = IDP_Document_Ingestion`, `businessKey = idpUploadId`, variables from form.
-5. Update `idp_workflow_key`, `upload_status = PROCESSING`.
+1. Validate file type/size — accept `.pdf` or `.zip`.
+2. **If PDF:** insert content + meta (`status=UPLOADED`, `entity` from form).
+3. **If ZIP:** `batchId`; per `.pdf` entry: content + meta.
+4. `startWorkflowProcess(processKey=ESS_Payments_Document_Ingestion, referenceId=uploadId, variables incl. entity)`.
+5. Update meta: `status=PROCESSING`.
 
-**Must not** start `IAP_ID_Manual_Payment` or country payment processes directly.
+#### `ExtractionUploadActionService`
 
-#### `IdpUploadContentService`
+See §9.4 and [API Reference §3](./IDP_API_Reference.md#3-maker--checker-action-apis--gateway-facade-required).
 
-1. **Only** service/repository that touches `fss_idp_upload_content`.
-2. `getContent(idpUploadId)` — single-row `SELECT file_content` when OCR pipeline requests bytes.
-3. Exposed via internal `GET /internal/uploads/{id}/content` for idp-extraction-service.
-4. Never joined or eagerly loaded from `IdpUploadEntity`.
+#### `ExtractionTriggerHandler`
 
-#### `IDPTriggerExtractionHandler`
+1. Load meta + blob; resolve `templateId = entityTemplateRegistry.resolveTemplateId(meta.getEntity())`.
+2. `extractionServiceClient.extract(...)` → typed `ExtractResponse`.
+3. On success: build `ExtractionHeader`; for each `InitiationDetail` build `StoredExtractedData`, `codec.toJson`, INSERT detail row, denormalize columns from POJO.
+4. On 422: FAIL details + meta; on timeout: rethrow for Camunda retry.
+5. `complete(task, Map.of("extractionStatus", status))`.
 
-1. Create `fss_idp_extraction_run` (`PENDING`, `is_latest=true`).
-2. Fetch blob via `IdpUploadContentService`; call idp-extraction-service `POST /v1/extract` (**synchronous** — blocks until OCR+LLM finish; configure Camunda external-task lock ≥ 15 min).
-3. On success: persist `structured_output`, `overall_confidence`, `run_status=READY_FOR_REVIEW`; set `upload_status=READY_FOR_REVIEW`.
-4. `complete(Trigger_IDP_Extraction)` then `correlate(IDPExtractionCompleted, businessKey=idpUploadId, { idpStatus, extractionRunId })` — both from **gateway**, never extraction service.
-5. On failure: set run/upload `FAILED`; fail external task; optionally correlate `IDPExtractionFailed` — do not correlate success.
+#### `ExtractionPaymentHandoffHandler`
 
-See §7.6 for crash/timeout recovery and reconciliation job.
+1. Load meta + details; idempotency guard on `message_id`.
+2. `EntityPaymentMapper mapper = entityHandlerRegistry.require(meta.getEntity())`.
+3. Per detail: `mapper.mapToPayment(codec.fromJson(detail.getExtractedData()), meta)` → `MessageService.save` → correlate via `routeRegistry.resolve(meta.getEntity())`.
+4. Update meta `APPROVED`; complete task.
 
-#### `IDPTriggerPaymentHandler`
+#### `IAPExtractionInitializeHandler`
 
-1. Load upload; guard `payment_workflow_key`.
-2. `registry.resolve(country, entity, processId, subProcessId)`.
-3. Build correlation variables (§3.3).
-4. `startMessageCorrelation(route.messageName(), ...)`.
-5. Update `payment_workflow_key`, `payment_trigger_message`, `upload_status = APPROVED`.
-6. Audit `PAYMENT_TRIGGERED`.
-7. Complete external task.
+Load `fss_services_message` by `businessKey`; complete task — same package as `IAPIDPaymentTransactionHandler`.
 
-#### `IAPIDPInitializeHandler` (`Initialize_IAP_From_IDP`)
+---
 
-1. Load latest extraction run `structured_output` (`is_latest=true`).
-2. `IDPStructuredOutputMapper` → `Payment` / `PaymentData` (§7.4).
-3. `MessageService.save` with `channel=IDP_UPLOAD`, `country=ID`.
-4. Set `messageId` variable; complete task.
-5. Flow continues to `Initialize_IAP_ID_Payments` — **no changes** to downstream handlers.
+## 10. Frontend implementation strategy
 
-#### Country-specific init handlers (phase 2)
+See [IDP_UX_Design.md §8](./IDP_UX_Design.md#8-implementation-task-list-frontend) for the concrete, buildable task list against the real current components.
 
-- `CNEFTPDPInitializeHandler` — same structure, CN-specific mapper.
-- Consider abstract `AbstractIDPInitializeHandler` with injected `PaymentMapper` per country.
+---
 
-### 7.4 JSON → Payment mapping (ID)
+## 11. Two maker-checker cycles
 
-Handler: `Initialize_IAP_From_IDP` / `IAPIDPInitializeHandler`
+See [Design doc §7](./IDP_Document_Ingestion_Design.md#7-two-maker-checker-cycles).
 
-| JSON path | Payment / Message field |
-|-----------|-------------------------|
-| `header.uniqueId` | External ref / `functional_id` |
-| `initiationDetail.TxRef` | Transaction reference |
-| `initiationDetail.TrnTyp` / `SubActivityId` | Transaction type |
-| `initiationDetail.ClntNm` | Client name |
-| `initiationDetail.ValDt` | Value date |
-| `TransactionDetails[*]` | Payment attributes |
-| `DebitDetails.details[*].data` | Debit legs |
-| `CreditDetails.details[*].data` | Credit legs |
-| `header.doc_ids[0]` | Document linkage |
+---
 
-Reference: [../after_ocr-llm-output.json](../after_ocr-llm-output.json)
+## 12. Test strategy
 
-Keep mapper **per country** when CN field shapes diverge; share leg-building utilities.
+### 12.1 Regression (on `IAP_ID_Payments` v(N+1) before prod)
 
-### 7.5 idp-extraction-service pipeline
+See [Design doc §12](./IDP_Document_Ingestion_Design.md#12-regression-test-matrix).
 
-```mermaid
-flowchart LR
-    A["Run created PENDING"] --> LF["Fetch blob from fss_idp_upload_content"]
-    LF --> B["OCR_IN_PROGRESS"]
-    B --> C["LLM_IN_PROGRESS"]
-    C --> D{"OK?"}
-    D -->|yes| E["Gateway persists run + advances workflow"]
-    D -->|no| F["FAILED + optional IDPExtractionFailed"]
-    E --> G["Populate structured_output + optional field rows"]
-```
+### 12.2 Extraction-specific
 
-On success:
+| # | Scenario | Expected |
+|---|---|---|
+| 1 | Upload PDF | Row `PROCESSING`, `ESS_Payments_Document_Ingestion` instance started |
+| 2 | Extraction complete (200) | `READY_FOR_REVIEW`, row clickable |
+| 3 | Extraction fails (422) | `FAILED`, no retry, row clickable for re-extract; `ExtractionResultGateway` default flow routes to `CancelExtractionUpload` |
+| 4 | Extraction times out | Retried per `ExternalTaskHelper` policy, then `FAILED` after exhaustion |
+| 5 | Maker submit | `POST {GW}/submit?uploadId={id}` → audit `MAKER_SUBMIT`, meta/details `SUBMITTED`, then gateway completes `Extraction_MakerReview` |
+| 6 | Checker reject | `POST {GW}/reject?uploadId={id}` → audit `CHECKER_REJECT`, `REJECTED`, back to maker |
+| 7 | Re-extract | All detail rows: `retry+1`, clear `extracted_data`/`error_desc`, `status=PROCESSING` |
+| 8 | Maker cancel upload | `POST {GW}/cancel?uploadId={id}` → audit `MAKER_CANCEL`, `CANCELLED` |
+| 9 | ZIP with 2 PDFs | 2 upload rows, shared `batch_id`, 2 ingestion instances |
+| 10 | ZIP with no PDFs | `400` from upload API |
+| 11 | Multi-instruction PDF (N=3) approve | 3 rows in `fss_payment_data_ingest_details` with `message_id`; 3× `IAP_ID_Extraction_Trigger` |
 
-1. Update extraction run + upload status; set `overall_confidence`.
-2. Optionally flatten to `fss_idp_extracted_field` (including per-field `confidence`).
-3. **Gateway** correlates `IDPExtractionCompleted` (after sync HTTP returns and DB is updated) — never the extraction service.
+---
 
-### 7.6 Error handling & resilience
+## 13. Repository discovery (run before implementation)
 
-| Layer | Strategy |
-|-------|----------|
-| External tasks | `ExternalTaskHelper` retries; `Trigger_IDP_Extraction` lock **PT15M**, HTTP read **900000 ms** — see §7.8 |
-| Extract completion (Phase 1) | **Synchronous** `POST /v1/extract` — gateway knows done when HTTP returns; then DB update → complete task → correlate `IDPExtractionCompleted` |
-| Extract completion (Phase 2) | Async `202` + gateway poll `GET /v1/extract/{id}` or callback to gateway internal endpoint — still **no** workflow client in extraction service |
-| Handoff | If correlate fails, **do not** complete `Trigger_IDP_Payment`; upload stays `SUBMITTED`; ops alert |
-| Extraction retry | `retry_count` on run; re-extract creates new run, marks old `is_latest=false` |
-| Stuck uploads | Reconciliation scheduler in gateway (see §7.6.1) |
-| Payment gateways | Existing IAP behavior after handoff — no IDP changes |
+### 13.1 How to run
 
-#### 7.6.1 Reconciliation scheduler (gateway)
+1. Open workspace containing `51786-payment-gateway-service`, `51786-workflow-management`, `51786-idp-extraction-service`.
+2. Paste prompt from [IDP_LLD_REPO_SCAN_PROMPT.md](./IDP_LLD_REPO_SCAN_PROMPT.md) into Cursor/agent.
+3. Record findings in §13.2 below (or `IDP_LLD_REPO_FINDINGS.md`).
 
-Periodic job (e.g. every 5 min) in **payment-gateway-service**:
+### 13.2 Reuse & alignment report (fill after scan)
 
-| Condition | Action |
-|-----------|--------|
-| `upload_status=PROCESSING` AND run `run_status=READY_FOR_REVIEW` AND Camunda waiting on `IDPExtractionCompleted` | Re-correlate success message (idempotent) |
-| `upload_status=PROCESSING` AND run `run_status=FAILED` for > N min | Correlate failure / end process; set `upload_status=FAILED` |
-| `upload_status=PROCESSING` AND no run progress for > timeout | Mark `FAILED` or retry extract (config) |
+| LLD class / concern | Reuse (path) or New | Pattern reference (path:line) | Notes |
+|---------------------|---------------------|-------------------------------|-------|
+| `AbstractExtractionExternalTaskHandler` | _TBD_ | _e.g. IAP*Handler_ | |
+| `ExternalTaskHelper` | _TBD_ | | |
+| `WorkflowService` | _TBD_ | | |
+| `IAPIDPaymentsMessageHandler` | _TBD_ | | |
+| `MessageService` / DOC_EXTRACTION | _TBD_ | | |
+| `CountrySpecificProcessorFactory` | _TBD_ | | Registry pattern |
+| `InitiationDetail` / `ExtractedField` | _TBD_ | extraction service | Import, don't duplicate |
+| `BulkUploadController` | _TBD_ | | URL conventions |
+| `ObjectMapper` / Jackson config | _TBD_ | | |
+| Java version (parent POM) | _TBD_ | | Enables record/sealed |
 
-#### 7.6.2 Failure matrix
+### 13.3 Expected repo touch list
 
-| Scenario | Extraction service | Gateway DB | Camunda | Recovery |
-|----------|-------------------|------------|---------|----------|
-| Extract HTTP timeout | May have audit `FAILED` or none | Run `FAILED` or `PENDING` | Task lock expires → retry | Handler retry; optional `GET` audit by `correlationId` |
-| Gateway crash mid-HTTP | Audit may be `COMPLETED` | Run incomplete | Lock expires → retry | Poll `GET /v1/extract/{extractionId}` or re-post if no audit |
-| DB saved, correlate fails | — | Run `READY`, upload `PROCESSING` | Stuck at catch event | Reconciliation job correlates |
-| Extraction service down | 503 | No change | Task retries | Backoff retry; UI shows Processing |
-| Camunda down | Extract may finish | DB updated | Complete/correlate fails | Handler throws; retry when WFM up |
-
-**Idempotency keys:** `idpUploadId` (business key) + `extraction_run_id`; before re-extracting, check `idp_extraction_audit` for `correlation_id=idpUploadId` and `job_status=COMPLETED`.
-
-### 7.7 Feature flags
-
-| Flag | Purpose |
+| Repo | Changes |
 |------|---------|
-| `idp.instruction-upload.enabled` | Show upload tab |
-| `idp.countries.enabled` | List e.g. `ID` only in v1 |
-| `idp.extraction.mock` | Mock OCR/LLM in lower env |
-
-### 7.8 Timeout configuration (OCR + LLM ≈ 10 min max)
-
-Phase 1 uses **synchronous** `POST /v1/extract`. Every layer in the call chain must allow the full pipeline to finish without premature disconnect. Use a **10 min processing budget** with a **15 min envelope** on outer HTTP/Camunda locks.
-
-#### Timeout hierarchy (outer ≥ inner)
-
-```mermaid
-flowchart TB
-    CAM["Camunda lockDuration\nPT15M"]
-    GW["Gateway HTTP read timeout\n900000 ms"]
-    EXT_SRV["Extraction Tomcat connection-timeout\n900000 ms"]
-    PIPE["Pipeline budget idp.extraction.max-pipeline-ms\n600000 ms"]
-    OCR["OCR client read-timeout-ms\n420000 ms"]
-    LLM["LLM read-timeout-ms\n240000 ms"]
-
-    CAM --> GW --> EXT_SRV --> PIPE
-    PIPE --> OCR
-    PIPE --> LLM
-```
-
-| Layer | Service | Property | Recommended | Notes |
-|-------|---------|----------|-------------|-------|
-| Camunda external task lock | payment-gateway | `lockDuration` on topic `Trigger_IDP_Extraction` | **PT15M** (900 s) | Must exceed gateway HTTP read timeout; set in BPMN or `@ExternalTaskSubscription` |
-| HTTP client → extraction | payment-gateway | `idp.extraction-client.read-timeout-ms` | **900000** (15 min) | Blocks until `/v1/extract` returns |
-| HTTP connect | payment-gateway | `idp.extraction-client.connect-timeout-ms` | **10000** | |
-| Tomcat connection (inbound) | idp-extraction-service | `server.tomcat.connection-timeout` | **900000** (15 min) | Must be ≥ gateway client read timeout |
-| Pipeline budget (OCR+LLM) | idp-extraction-service | `idp.extraction.max-pipeline-ms` | **600000** (10 min) | Target max processing time; use for watchdog/logging |
-| OCR API read | idp-extraction-service | `idp.api.read-timeout-ms` | **420000** (7 min) | Leaves headroom for LLM within 10 min budget |
-| LLM API read | idp-extraction-service | `idp.llm.read-timeout-ms` | **240000** (4 min) | Spring AI / OpenAI client; wire when not in mock mode |
-| Stale upload reconciliation | payment-gateway | `idp.upload.processing-stale-timeout-ms` | **1200000** (20 min) | Reconciliation job marks stuck `PROCESSING` rows |
-
-**Rule:** `Camunda lock ≥ gateway read ≥ extraction server timeout ≥ max-pipeline-ms ≥ (OCR + LLM timeouts)`.
-
-#### `51786-idp-extraction-service` — `application.yml`
-
-```yaml
-server:
-  tomcat:
-    connection-timeout: 900000   # 15 min — inbound POST /v1/extract
-
-idp:
-  extraction:
-    max-pipeline-ms: 600000      # 10 min OCR+LLM budget
-  api:
-    connect-timeout-ms: 10000
-    read-timeout-ms: 420000      # 7 min OCR
-  llm:
-    read-timeout-ms: 240000      # 4 min LLM structuring
-```
-
-#### `51786-payment-gateway-service` — `application.yml` (planned)
-
-```yaml
-idp:
-  extraction-client:
-    base-url: http://51786-idp-extraction-service:8095
-    connect-timeout-ms: 10000
-    read-timeout-ms: 900000        # 15 min — must not cut off sync extract
-  upload:
-    processing-stale-timeout-ms: 1200000
-  camunda:
-    external-tasks:
-      Trigger_IDP_Extraction:
-        lock-duration: PT15M
-        retries: 2
-```
-
-#### `IDPTriggerExtractionHandler` — timeout behaviour
-
-| Event | Gateway action |
-|-------|----------------|
-| HTTP read timeout to extraction service | Catch `ResourceAccessException` / timeout; `run_status=FAILED`; increment `retry_count`; **fail** external task (Camunda retries if retries remain) |
-| HTTP 422 / validation error from extraction | Permanent failure — no retry; `upload_status=FAILED` |
-| HTTP 200 but DB save fails | Do not complete/correlate; throw → Camunda retry |
-| Success within budget | Persist run, complete task, correlate `IDPExtractionCompleted` |
-
-#### Load balancer / API gateway (if any)
-
-Ensure any reverse proxy between gateway and extraction service has **idle/read timeout ≥ 900 s** (15 min). A 60 s default proxy timeout will break sync extract even when app timeouts are correct.
+| `51786-payment-gateway-service` | All Java in §9.1, `application.yml`, manual DDL scripts |
+| `51786-workflow-management` | Deploy `ESS_Payments_Document_Ingestion.bpmn`; additive `IAP_ID_Payments.bpmn` — **no new Java** for external workers |
+| `51786-idp-extraction-service` | **No change** in v1 — consume existing API + POJOs |
+| Portal UI | Per [IDP_UX_Design.md](./IDP_UX_Design.md) |
 
 ---
 
-## 8. Frontend implementation strategy
+## 14. Implementation order
 
-Align with [IDP_UX_Design.md](./IDP_UX_Design.md) §8.
-
-### 8.1 Components
-
-| Component | Responsibility |
-|-----------|----------------|
-| `IdPaymentsLandingPage` | Add `TabBar`; wrap existing dashboard |
-| `InstructionUploadTab` | Upload form + table |
-| `UploadForm` | Country (default ID), metadata dropdowns, file picker |
-| `UploadsTable` | Recent-first, disabled rows when processing |
-| `UploadDetailModal` | Field grids, role/status actions |
-| `useUploadsTable` | Fetch, 5s poll when processing rows exist |
-
-### 8.2 URL state
-
-| Query | Behavior |
-|-------|----------|
-| `tab=instruction-upload` | Active upload tab |
-| `uploadId={id}` | Open modal on load |
-| default / `tab=dashboard` | Existing dashboard |
-
-### 8.3 API integration map
-
-| Interaction | API |
-|-------------|-----|
-| Tab load | `GET /v1/idp/uploads?sort=recent&country=ID` |
-| Upload | `POST /v1/idp/uploads` |
-| Poll | `GET /v1/idp/uploads?sort=recent` every 5s if processing |
-| Modal | `GET /v1/idp/uploads/{id}` |
-| Save draft | `PATCH /v1/idp/uploads/{id}/fields` |
-| Submit / Approve / Reject | `POST /v1/workflow/complete` |
-| Re-extract | `POST /v1/idp/uploads/{id}/re-extract` |
-
-### 8.4 Role matrix (modal buttons)
-
-See [IDP_UX_Design.md](./IDP_UX_Design.md) §5 — implement via `ActionBar` driven by `uploadStatus` + `paymentMaker` / `paymentChecker`.
-
----
-
-## 9. Two maker-checker cycles
-
-| Stage | Process | Tasks | Purpose |
-|-------|---------|-------|---------|
-| Extraction QC | `IDP_Document_Ingestion` | `IDP_MakerReview`, `IDP_CheckerReview` | Validate OCR/LLM fields |
-| Payment QC | `IAP_ID_Payments` (etc.) | `IAP_ID_MakerPayment`, `IAP_ID_CheckerPayment` | Banking repair / approval |
-
-After IDP checker approves:
-
-- Handoff sets `isApproved=true`.
-- `PaymentValidationGateway` may skip payment checker when `isRepaired=false` and `isApproved=true` (existing `Flow_12mndij`).
-- `TO_BE_REPAIR` still routes to payment maker — no new logic.
-
-**Do not** reuse `IAP_ID_MakerPayment` for extraction review.
-
----
-
-## 10. Deployment plan
-
-| Phase | Deliverable | Prod risk |
-|-------|-------------|-----------|
-| P1 | DDL `fss_idp_*` | None |
-| P2 | `IDP_Document_Ingestion.bpmn` + mock extraction service | None on IAP |
-| P3 | Gateway IDP handlers (`Store`, `Trigger_Extraction`, `Trigger_Payment` with registry) | None until IDP started |
-| P4 | Additive `IAP_ID_Payments.bpmn` v(N+1) + `IAPIDPInitializeHandler` | Regression on old paths |
-| P5 | Real OCR + LLM | IDP path only |
-| P6 | UI tab behind feature flag | Controlled rollout |
-| P7 | Canary E2E ID upload → payment | New path only |
-
-**Order:** tables → IDP BPMN + extraction service → payment BPMN additive + init handler → enable UI flag.
-
-**Rollback:** disable feature flag; automated/bulk/manual IAP paths unaffected.
-
----
-
-## 11. Test strategy
-
-### 11.1 Regression (IAP v(N+1) before prod)
-
-| # | Scenario | Expected |
-|---|----------|----------|
-| 1 | Automated JMS | `Initialize_IAP_Payments` — unchanged |
-| 2 | Bulk upload ID | Bulk init — unchanged |
-| 3 | Manual start | `IAP_ID_MakerPayment` — unchanged |
-| 4 | IDP upload → approve → handoff | `Initialize_IAP_From_IDP` → enrichment |
-| 5 | IDP double approve | Single payment instance |
-| 6 | IDP handoff failure | No duplicate payment; retriable task |
-| 7 | Wrong country in registry | Clear error; no correlate |
-
-### 11.2 IDP-specific
-
-| # | Scenario | Expected |
-|---|----------|----------|
-| 1 | Upload PDF | Row `PROCESSING`, workflow started |
-| 2 | Extraction complete | `READY_FOR_REVIEW`, row clickable |
-| 3 | Maker submit | `SUBMITTED` |
-| 4 | Checker reject | `REJECTED`, back to maker |
-| 5 | Re-extract | New run, old `is_latest=false` |
-| 6 | Cancel upload | `CANCELLED` |
-| 7 | Modal deep link | `?tab=instruction-upload&uploadId=` |
-
----
-
-## 12. Risk register
-
-| Risk | Mitigation |
-|------|------------|
-| Editing shared IAP gateway conditions | Additive-only BPMN diff; code review |
-| Message name collision | Country-prefixed names: `IAP_ID_IDP_Trigger`, `CN_ETF_IDP_Trigger` |
-| Duplicate payment instances | `payment_workflow_key` idempotency |
-| Registry misconfiguration | Startup validation; integration test per route |
-| Two Cockpit instances | Shared `businessKey=idpUploadId`; link columns on upload row |
-| Deploy payment BPMN without init worker | Deploy workers before UI flag |
-| PII in CLOB columns | Retention policy; mask in non-prod |
-
----
-
-## 13. Open questions
-
-| # | Question | Owner |
-|---|----------|-------|
-| 1 | OCR API contract (auth, callback, max size) | IDP / integration |
-| 2 | LLM hosting and prompt versioning | IDP |
-| 3 | Final upload tab label ([IDP_UX_Design.md](./IDP_UX_Design.md) §2.1.1) | UX |
-| 4 | Separate `entity` dropdown vs infer from metadata | UX / product |
-| 5 | Route config: YAML vs `fss_idp_payment_route` table | Engineering |
-| 6 | SSTM feedback for `channel=IDP_UPLOAD` | Payments |
-| 7 | PDF preview in modal v1? | UX |
-
----
-
-## 14. Document history
-
-| Date | Change |
-|------|--------|
-| 2026-07-30 | Initial LLD — common IDP BPMN, per-country payment triggers, tables, code strategy |
-| 2026-08-02 | Orchestration boundary; Phase 1 sync extract; resilience §7.6; timeout hierarchy §7.8 |
-| 2026-08-02 | Routing §4.0; consolidated into `final/` pack |
+| Step | Deliverable | Depends on |
+|------|-------------|------------|
+| 1 | Repo scan (§13) | Active workspace |
+| 2 | Manual DDL V1–V4 | DBA |
+| 3 | JPA entities + repositories | DDL |
+| 4 | `ExtractionProperties` + YAML registries | — |
+| 5 | `ExtractedDataCodec` + import extraction POJOs | Scan §13 |
+| 6 | `IdEntityPaymentMapper` | Codec + POJOs |
+| 7 | `ExtractionUploadService` + controller upload/list | Entities, WorkflowService |
+| 8 | `AbstractExtractionExternalTaskHandler` + `ExtractionTriggerHandler` | Client, codec, registries |
+| 9 | `ExtractionUploadActionService` + handlers | Audit, WorkflowService |
+| 10 | `ExtractionPaymentHandoffHandler` | Mapper, route registry, MessageService |
+| 11 | `IAPExtractionInitializeHandler` | IAP handler pattern |
+| 12 | BPMN deploy + E2E tests | §12 |
