@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:bioc="http://bpmn.io/schema/bpmn/biocolor/1.0" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="Definitions_FSS_Payments_Document_Ingestion" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="3.6.0">
+  <bpmn:process id="FSS_Payments_Document_Ingestion" name="FSS Payments Document Ingestion" isExecutable="true" camunda:historyTimeToLive="10000">
+    <bpmn:startEvent id="Extraction_Upload_Start" name="Document Upload Received">
+      <bpmn:outgoing>Flow_Start_Extract</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_Start_Extract" sourceRef="Extraction_Upload_Start" targetRef="Trigger_Data_Extraction" />
+    <bpmn:serviceTask id="Trigger_Data_Extraction" name="Data Extraction" camunda:type="external" camunda:topic="Trigger_Data_Extraction">
+      <bpmn:incoming>Flow_Start_Extract</bpmn:incoming>
+      <bpmn:outgoing>Flow_Extract_Gateway</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_Extract_Gateway" sourceRef="Trigger_Data_Extraction" targetRef="ExtractionResultGateway" />
+    <bpmn:exclusiveGateway id="ExtractionResultGateway" name="Extraction Result Gateway" default="Flow_Extract_Fail">
+      <bpmn:incoming>Flow_Extract_Gateway</bpmn:incoming>
+      <bpmn:outgoing>Flow_Extract_Success</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Extract_Fail</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="Flow_Extract_Success" name="Extraction Successful" sourceRef="ExtractionResultGateway" targetRef="Extraction_UserReview">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${extractionStatus=='READY_FOR_REVIEW'}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_Extract_Fail" name="Extraction Failed" sourceRef="ExtractionResultGateway" targetRef="CancelExtractionUpload" />
+    <bpmn:userTask id="Extraction_UserReview" name="User Review" camunda:assignee="${paymentMaker}">
+      <bpmn:incoming>Flow_Extract_Success</bpmn:incoming>
+      <bpmn:outgoing>Flow_UserReview_Decision</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="Flow_UserReview_Decision" sourceRef="Extraction_UserReview" targetRef="UserReviewGateway" />
+    <bpmn:exclusiveGateway id="UserReviewGateway" name="User Review Decision" default="Flow_UserReview_Cancel">
+      <bpmn:incoming>Flow_UserReview_Decision</bpmn:incoming>
+      <bpmn:outgoing>Flow_UserReview_Submit</bpmn:outgoing>
+      <bpmn:outgoing>Flow_UserReview_Cancel</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="Flow_UserReview_Submit" name="Submit for Routing" sourceRef="UserReviewGateway" targetRef="Trigger_Payment_From_Extraction">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${reviewAction=='SUBMIT'}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_UserReview_Cancel" name="Cancel" sourceRef="UserReviewGateway" targetRef="CancelExtractionUpload" />
+    <bpmn:serviceTask id="Trigger_Payment_From_Extraction" name="Create Payment From Extracted Data" camunda:type="external" camunda:topic="Trigger_Payment_From_Extraction">
+      <bpmn:incoming>Flow_UserReview_Submit</bpmn:incoming>
+      <bpmn:outgoing>Flow_Trigger_End</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_Trigger_End" sourceRef="Trigger_Payment_From_Extraction" targetRef="Event_Extraction_End" />
+    <bpmn:endEvent id="Event_Extraction_End" name="Payment Created">
+      <bpmn:incoming>Flow_Trigger_End</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="CancelExtractionUpload" name="Document Ingestion Cancelled">
+      <bpmn:incoming>Flow_Extract_Fail</bpmn:incoming>
+      <bpmn:incoming>Flow_UserReview_Cancel</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:textAnnotation id="TextAnnotation_Trigger_Payment">
+      <bpmn:text>Correlates IAP_ID payment message — one instance per instruction</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Trigger_Payment" sourceRef="Trigger_Payment_From_Extraction" targetRef="TextAnnotation_Trigger_Payment" />
+    <bpmn:textAnnotation id="TextAnnotation_UserReview">
+      <bpmn:text>User updates extracted fields then submits for routing</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_UserReview" sourceRef="Extraction_UserReview" targetRef="TextAnnotation_UserReview" />
+    <bpmn:textAnnotation id="TextAnnotation_Common">
+      <bpmn:text>Common document ingestion &amp; extraction process for all countries</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Common" sourceRef="Extraction_Upload_Start" targetRef="TextAnnotation_Common" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_Extraction">
+    <bpmndi:BPMNPlane id="BPMNPlane_Extraction" bpmnElement="FSS_Payments_Document_Ingestion">
+      <bpmndi:BPMNEdge id="Flow_Start_Extract_di" bpmnElement="Flow_Start_Extract">
+        <di:waypoint x="277" y="250" />
+        <di:waypoint x="329" y="250" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Extract_Gateway_di" bpmnElement="Flow_Extract_Gateway">
+        <di:waypoint x="429" y="250" />
+        <di:waypoint x="525" y="250" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Extract_Success_di" bpmnElement="Flow_Extract_Success">
+        <di:waypoint x="575" y="250" />
+        <di:waypoint x="660" y="250" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="583" y="256" width="54" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Extract_Fail_di" bpmnElement="Flow_Extract_Fail">
+        <di:waypoint x="550" y="275" />
+        <di:waypoint x="550" y="408" />
+        <di:waypoint x="742" y="408" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="459" y="343" width="82" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_UserReview_Decision_di" bpmnElement="Flow_UserReview_Decision">
+        <di:waypoint x="760" y="250" />
+        <di:waypoint x="810" y="250" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_UserReview_Submit_di" bpmnElement="Flow_UserReview_Submit">
+        <di:waypoint x="860" y="250" />
+        <di:waypoint x="950" y="250" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="868" y="256" width="52" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_UserReview_Cancel_di" bpmnElement="Flow_UserReview_Cancel">
+        <di:waypoint x="835" y="275" />
+        <di:waypoint x="835" y="408" />
+        <di:waypoint x="778" y="408" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="792" y="343" width="35" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Trigger_End_di" bpmnElement="Flow_Trigger_End">
+        <di:waypoint x="1050" y="250" />
+        <di:waypoint x="1112" y="250" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="Extraction_Upload_Start_di" bpmnElement="Extraction_Upload_Start">
+        <dc:Bounds x="241" y="232" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="215" y="190" width="89" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Trigger_Data_Extraction_di" bpmnElement="Trigger_Data_Extraction" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="329" y="210" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ExtractionResultGateway_di" bpmnElement="ExtractionResultGateway" isMarkerVisible="true">
+        <dc:Bounds x="525" y="225" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="508" y="195" width="84" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Extraction_UserReview_di" bpmnElement="Extraction_UserReview" bioc:stroke="rgb(251, 140, 0)" bioc:fill="rgb(255, 224, 178)">
+        <dc:Bounds x="660" y="210" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="UserReviewGateway_di" bpmnElement="UserReviewGateway" isMarkerVisible="true">
+        <dc:Bounds x="810" y="225" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="793" y="195" width="88" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Trigger_Payment_From_Extraction_di" bpmnElement="Trigger_Payment_From_Extraction" bioc:stroke="rgb(30, 136, 229)" bioc:fill="rgb(187, 222, 251)">
+        <dc:Bounds x="950" y="210" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_Extraction_End_di" bpmnElement="Event_Extraction_End">
+        <dc:Bounds x="1112" y="232" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1087" y="275" width="86" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="CancelExtractionUpload_di" bpmnElement="CancelExtractionUpload">
+        <dc:Bounds x="742" y="390" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="735" y="430" width="51" height="40" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Trigger_Payment_di" bpmnElement="TextAnnotation_Trigger_Payment">
+        <dc:Bounds x="947" y="80" width="160" height="40" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_UserReview_di" bpmnElement="TextAnnotation_UserReview">
+        <dc:Bounds x="657" y="80" width="160" height="40" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Common_di" bpmnElement="TextAnnotation_Common">
+        <dc:Bounds x="160" y="355" width="220" height="40" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_Trigger_Payment_di" bpmnElement="Association_Trigger_Payment">
+        <di:waypoint x="999" y="210" />
+        <di:waypoint x="998" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_UserReview_di" bpmnElement="Association_UserReview">
+        <di:waypoint x="709" y="210" />
+        <di:waypoint x="708" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Common_di" bpmnElement="Association_Common">
+        <di:waypoint x="251" y="266" />
+        <di:waypoint x="209" y="355" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

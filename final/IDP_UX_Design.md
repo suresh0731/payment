@@ -1,4 +1,4 @@
-# ESS Payments Document Upload — UX Design Specification
+# FSS Payments Document Upload — UX Design Specification
 
 > **Status:** **Final v4** — ZIP bulk upload, multi-instruction review (see [README.md](./README.md))  
 > **Created:** 2026-07-30 · **Finalized:** 2026-08-04  
@@ -92,14 +92,15 @@ Same single-surface pattern as before — **all IDP functionality lives in this 
 │ Accepts: .pdf (single) or .zip (multiple PDFs inside; other files ignored) │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ UPLOADS                                          Recent first             │
-├──────────────┬────────────┬──────────────┬────────────┬────────────────┤
-│ File name    │ Uploaded   │ Status       │ By         │ Payment ref    │
-├──────────────┼────────────┼──────────────┼────────────┼────────────────┤
-│ 3897122.pdf  │ 10:22 today│ Ready review │ you        │ — (2 payments) │  ← clickable; multi-instruction
-│ 3897011.pdf  │ 09:15 today│ Processing   │ you        │ —              │  ← disabled
-│ 3896990.pdf  │ yesterday  │ With checker │ jsmith     │ —              │  ← clickable
-│ 3896880.pdf  │ yesterday  │ Completed    │ you        │ PAY-12345      │  ← clickable
-└──────────────┴────────────┴──────────────┴────────────┴────────────────┘
+├──────────────┬────────────┬──────────────┬────────────┬──────────────┬─────┤
+│ File name    │ Uploaded   │ Status       │ Instructions │ Confidence   │ By  │
+├──────────────┼────────────┼──────────────┼──────────────┼──────────────┼─────┤
+│ 3897122.pdf  │ 10:22 today│ Ready review │ 18           │ 91.2%        │ you │  ← multi-instruction
+│ 3897011.pdf  │ 09:15 today│ Processing   │ —            │ —            │ you │  ← disabled
+│ 3896990.pdf  │ yesterday  │ Submitted    │ 2            │ 95.0%        │ jsmith│
+│ 3896880.pdf  │ yesterday  │ Completed    │ 1            │ 96.5%        │ you │
+└──────────────┴────────────┴──────────────┴──────────────┴──────────────┴─────┘
+     Instructions = instruction_count · Confidence = overall LLM extract confidence (meta.confidence)
 ```
 
 After upload: stay on **upload tab**; new row(s) appear at top with `Processing`. ZIP uploads create **one table row per PDF** (shared `batchId`); show a toast summarising count and any `skippedEntries`.
@@ -110,6 +111,16 @@ After upload: stay on **upload tab**; new row(s) appear at top with `Processing`
 - Auto-refresh every 5s while any row is processing (pause when modal open)  
 - Optional filters: Status, date range, My uploads only, **Batch ID** (for ZIP uploads)  
 
+#### 2.4.1 Table column rule — instructions only (no payment ref)
+
+The uploads table **always** shows **instruction count** in the Instructions column (`1`, `2`, `18`), regardless of status — including `COMPLETED`. Do **not** swap that column to `PAY-12345` for completed files; mixed semantics (numbers vs payment refs in the same column) confuses users.
+
+**Payment references and navigation** live in the **detail modal** only:
+
+- `COMPLETED` → open modal (same screen as review) → per-instruction **View payment** link when `paymentRef` / `paymentId` is set on `ingestDetails[]`
+- Single-payment file: table shows `1`; user clicks row → modal → one link
+- Multi-payment file: table shows `18`; user clicks row → modal → 18 links in left panel or footer
+
 ---
 
 ## 3. Row click behavior
@@ -118,10 +129,10 @@ After upload: stay on **upload tab**; new row(s) appear at top with `Processing`
 |--------|-----|-------|-------|
 | `Processing` / OCR / LLM | Muted | **Disabled** | — |
 | `FAILED` | Error chip | Enabled | Error + Re-upload (maker) |
-| `READY_FOR_REVIEW` | Active | Enabled | Editable (maker) |
-| `SUBMITTED` | Active | Enabled | Read-only; checker actions |
-| `REJECTED` | Warning | Enabled | Editable (maker) |
-| `APPROVED` / in progress | Active | Enabled | Read-only + payment link |
+| `READY_FOR_REVIEW` | Active | Enabled | Editable |
+| `SUBMITTED` | Active | Enabled | Read-only (submit acknowledged) |
+| `TRIGGERING_PAYMENT` | Active | Enabled | Read-only (routing in progress) |
+| `COMPLETED` | Active | Enabled | Read-only + payment link(s) |
 | `COMPLETED` | Neutral | Enabled | Read-only view |
 | `CANCELLED` | Muted | Optional | Read-only |
 
@@ -137,7 +148,8 @@ Tabs **do not scale** beyond ~5 instructions. Use a **master–detail** layout: 
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ 3897122.pdf · 18 instructions · Ready for review          Min conf: 87.1% [×]│
+│ 3897122.pdf · 18 instructions · Ready for review          Confidence: 91.2% [×]│
+     API: instructionCount · confidence (getDetail / meta)
 ├───────────────────────────────┬──────────────────────────────────────────────┤
 │ INSTRUCTIONS (18)             │ INSTRUCTION 7 — 3897122-007                  │
 │ [Search…] [SubAct ▼] [BT|OTT] │ SubActivity: Subscription · TrnTyp: BT       │
@@ -154,7 +166,7 @@ Tabs **do not scale** beyond ~5 instructions. Use a **master–detail** layout: 
 ├───────────────────────────────┴──────────────────────────────────────────────┤
 │ ⚠ 3 instructions below confidence threshold · [Show low-confidence only]      │
 │ Comments (file-level)                                                          │
-│ [ Save draft ]  [ Submit to checker ]  [ Re-extract ]  [ Cancel upload ]      │
+│ [ Save draft ]  [ Submit for routing ]  [ Re-extract ]  [ Cancel upload ]      │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -186,25 +198,38 @@ Data source: `GET .../getDetail?uploadId=` → `ingestDetails[]` (one row per `f
 
 Same field grids as today (`TransactionDetails`, `DebitDetails`, `CreditDetails`) scoped to **one** `ingestDetails[].extractedData`. Low-confidence cells highlighted (`Confidence < 90`).
 
-After checker approve, show **Payment link** per row when `message_id` is set (`handoff_at` populated).
+After submit for routing, show **View payment** link on each instruction when `paymentId` / `paymentRef` is set (`COMPLETED`). For `READY_FOR_REVIEW`, no payment links — fields only.
+
+**Completed modal (read-only):** same master–detail layout; footer shows **Close** (+ optional **View payment** for selected instruction). Payment refs are never duplicated in the uploads table.
 
 ### 4.4 Uploads table (landing)
 
-| File name | Uploaded | Status | Instructions | Min conf | By |
-|-----------|----------|--------|--------------|----------|-----|
-| 3897122.pdf | today | Ready | **18** (3⚠) | 87.1% | you |
+| File name | Uploaded | Status | Instructions | Confidence | By |
+|-----------|----------|--------|--------------|------------|-----|
+| 3897122.pdf | today | Ready | **18** | 91.2% | you |
 
-Do **not** list 18 rows on the landing table — one row per **PDF**; drill into modal for instructions.
+**API mapping** ([API Reference §2.3](./IDP_API_Reference.md#23-get-apifsspaymentsgatewayv1extraction-uploadsgetuploads)):
+
+| Column | Response field | DB source |
+|--------|----------------|-----------|
+| Instructions | `instructionCount` | `fss_payment_upload_meta.instruction_count` |
+| Confidence | `confidence` — hide when `null` (`PROCESSING`) | `fss_payment_upload_meta.confidence` — overall LLM extract confidence for the document |
+
+Aggregates are **stored on meta** and refreshed on write — not computed on each list poll ([LLD §5.1.1](./IDP_LLD.md#511-file-level-aggregates-on-meta-denormalized--not-computed-on-list-read)).
+
+Do **not** show `paymentRef` in the table. Payment links: `getDetail` → `ingestDetails[].paymentRef` in modal only ([§2.4.1](./IDP_UX_Design.md#241-table-column-rule--instructions-only-no-payment-ref)).
+
+Do **not** list 18 rows on the landing table — one row per **PDF**; drill into modal for instructions and payment links.
 
 ### 4.5 Why this fits the data model
 
 | Layer | Camunda | DB | UI |
 |-------|---------|-----|-----|
-| File | 1× `ESS_Payments_Document_Ingestion` per PDF | 1× `fss_payment_upload_meta` | 1 uploads-table row |
+| File | 1× `FSS_Payments_Document_Ingestion` per PDF | 1× `fss_payment_upload_meta` | 1 uploads-table row |
 | Instruction | N/A until handoff | N× `fss_payment_data_ingest_details` | N rows in left panel |
-| Payment | N× `IAP_ID_Payments` after approve | N× `message_id` on detail rows | N payment links post-approve |
+| Payment | N× `IAP_ID_Payments` after submit | N× `message_id` on detail rows | N payment links post-handoff |
 
-One maker/checker task reviews **the whole file**; each instruction still gets its own `fss_services_message` and payment process at handoff.
+One user review task covers **the whole file**; each instruction still gets its own `fss_services_message` and payment process at handoff.
 
 ---
 
@@ -216,27 +241,20 @@ For files with **≤5** instructions, horizontal tabs remain acceptable. Default
 
 ## 5. Modal buttons by role and status
 
-### Maker (`paymentMaker`)
+### User (`paymentMaker`)
 
 | Status | Fields | Buttons |
 |--------|--------|---------|
-| `READY_FOR_REVIEW` / `REJECTED` | Editable | Save draft · Submit to checker · Re-extract · Cancel upload |
-| `SUBMITTED` | Read-only | Close |
-| `APPROVED` / `COMPLETED` | Read-only | Close · View payment |
+| `READY_FOR_REVIEW` | Editable | Save draft · Submit for routing · Re-extract · Cancel upload |
+| `SUBMITTED` / `TRIGGERING_PAYMENT` | Read-only | Close (routing in progress) |
+| `COMPLETED` | Read-only | Close · **View payment** (per instruction in modal — not in table) |
 | `FAILED` | Error | Re-upload · Close |
-
-### Checker (`paymentChecker`)
-
-| Status | Fields | Buttons |
-|--------|--------|---------|
-| `SUBMITTED` | Read-only | Approve · Reject (comment required) · Close |
-| Other | Read-only | Close · View payment (if done) |
+| `CANCELLED` | Read-only | Close |
 
 | Button | Gateway API (not workflow-management) |
 |--------|--------------------------------------|
-| Submit to checker | `POST .../performAction?uploadId={id}` `{ "action": "SUBMIT" }` or `POST .../submit?uploadId={id}` |
-| Approve / Reject | `POST .../performAction` `{ "action": "APPROVE" \| "REJECT" }` or `/approve` / `/reject` |
-| Cancel upload | `POST .../performAction` `{ "action": "CANCEL" }` or `POST .../cancel?uploadId={id}` |
+| Submit for routing | `POST .../performAction?uploadId={id}` `{ "action": "SUBMIT" }` (optional alias: `/submit`) |
+| Cancel upload | `POST .../performAction?uploadId={id}` `{ "action": "CANCEL" }` (optional alias: `/cancel`) |
 | Re-extract | `POST .../re-extract?uploadId={id}` → row returns to Processing |
 
 ---
@@ -318,7 +336,7 @@ IdPaymentsLandingPage
 │         │     ├── FilePicker
 │         │     └── UploadButton → POST /v1/idp/uploads
 │         ├── UploadsTable
-│         │     ├── columns: file, uploaded, status, by, paymentRef
+│         │     ├── columns: file, uploaded, status, instructions, confidence, by
 │         │     ├── rowClick → open modal if clickable
 │         │     └── polling when status = processing
 │         └── UploadDetailModal (portal)
@@ -355,7 +373,7 @@ See [IDP_API_Reference.md](./IDP_API_Reference.md) for full request/response sha
 | Table poll | `GET .../getUploads?sort=recent` every 5s if processing rows exist |
 | Open modal | `GET .../getDetail?extractionUploadId={id}` |
 | Save draft | `POST .../fields?extractionUploadId={id}` |
-| Submit / Approve / Reject / Cancel | `POST .../performAction?uploadId={id}` with `{ "action": "…" }` (preferred) or `/submit`, `/cancel`, `/approve`, `/reject` — **never** direct `workflow-management` |
+| Submit / Cancel | `POST .../performAction?uploadId={id}` with `{ "action": "SUBMIT" | "CANCEL" }` — optional `/submit`, `/cancel` aliases — **never** direct `workflow-management` |
 | Re-extract | `POST .../re-extract?extractionUploadId={id}` |
 | View payment(s) | Navigate to payment detail per `paymentHandoffs[]` entry |
 
@@ -363,9 +381,9 @@ See [IDP_API_Reference.md](./IDP_API_Reference.md) for full request/response sha
 
 | UI action | Workflow effect |
 |-----------|-----------------|
-| Upload (PDF) | Starts `ESS_Payments_Document_Ingestion` — one instance per PDF |
+| Upload (PDF) | Starts `FSS_Payments_Document_Ingestion` — one instance per PDF |
 | Upload (ZIP) | Unpacks PDFs; one ingestion instance **per PDF**; shared `batchId` |
-| Checker approve | `POST .../approve?uploadId={id}` → gateway DB + audit → `Extraction_CheckerReview` complete → `Trigger_Payment_From_Extraction` → **N ×** `IAP_ID_Extraction_Trigger` |
+| Submit for routing | `POST .../performAction?uploadId={id}` `{ "action": "SUBMIT" }` → gateway DB + audit → `Extraction_UserReview` complete → `Trigger_Payment_From_Extraction` → **N ×** `IAP_ID_Extraction_Trigger` |
 
 UI change is **placement on landing tabs**, not workflow change. Entity routing is config-driven in gateway — see [IDP_Document_Ingestion_Design.md §2.1](./IDP_Document_Ingestion_Design.md#21-entity--payment-routing-responsibilities) and [IDP_LLD.md §4](./IDP_LLD.md#4-entity-routing--template-config).
 

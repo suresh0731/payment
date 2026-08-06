@@ -1,8 +1,8 @@
-# ESS Payments Document Ingestion — Final Documentation Pack
+# FSS Payments Document Ingestion — Final Documentation Pack
 
 > **Status:** Final — consolidated for implementation and review  
 > **Created:** 2026-08-02  
-> **Updated:** 2026-08-04 (v4 — ESS rename, ZIP bulk upload, multi-instruction fan-out; v6 — gateway façade for maker/checker actions)  
+> **Updated:** 2026-08-04 (v4 — FSS rename, ZIP bulk upload, multi-instruction fan-out; v6 — gateway façade for maker/checker actions)  
 > **Supersedes:** `draft/` working copies and `IDP_LLD_latest.md` (obsolete — safe to delete). Use **`final/`** as source of truth.
 
 ---
@@ -17,9 +17,9 @@
 |---------|-------------------|--------|
 | **Low Level Design (backend/DB)** | **[IDP_LLD.md](./IDP_LLD.md)** | Schema, handlers, gateway façade, DDL, tests |
 | Architecture & BPMN | [IDP_Document_Ingestion_Design.md](./IDP_Document_Ingestion_Design.md) | Two-BPMN strategy, ZIP, multi-instruction handoff |
-| REST APIs | [IDP_API_Reference.md](./IDP_API_Reference.md) | Upload + maker/checker action endpoints |
+| REST APIs | [IDP_API_Reference.md](./IDP_API_Reference.md) | Upload + user review action endpoints |
 | Portal UX | [IDP_UX_Design.md](./IDP_UX_Design.md) | Tabs, table, modal, button → API map |
-| BPMN deploy artifact | [ESS_Payments_Document_Ingestion.bpmn](./ESS_Payments_Document_Ingestion.bpmn) | Process id `ESS_Payments_Document_Ingestion` |
+| BPMN deploy artifact | [FSSPaymentsDocIngestion.bpmn](./FSSPaymentsDocIngestion.bpmn) | Process id `FSS_Payments_Document_Ingestion` |
 | Start here | [README.md](./README.md) | Index and reading order |
 
 ### Safe to delete (obsolete)
@@ -44,7 +44,7 @@
 
 | File | Description |
 |------|-------------|
-| [ESS_Payments_Document_Ingestion.bpmn](./ESS_Payments_Document_Ingestion.bpmn) | Common country-agnostic document ingestion process — deploy to `51786-workflow-management` |
+| [FSSPaymentsDocIngestion.bpmn](./FSSPaymentsDocIngestion.bpmn) | Common country-agnostic document ingestion process — deploy to `51786-workflow-management` |
 
 ### Related repo artifacts (outside `final/`)
 
@@ -86,7 +86,7 @@ flowchart LR
     GW -->|POST /v1/extract sync| EXT
     EXT -->|initiationDetail[] only| GW
     GW -->|merge header + complete task| WFM
-    UI -->|submit/cancel/approve/reject| GW
+    UI -->|performAction SUBMIT/CANCEL| GW
     GW -->|setTaskDetails + completeCurrentTask| WFM
     WFM -->|Trigger_Payment_From_Extraction| GW
     GW -->|N × startMessageCorrelation per instruction| WFM
@@ -97,13 +97,13 @@ flowchart LR
 
 | Rule | Detail |
 |------|--------|
-| One ingestion BPMN for all countries | `ESS_Payments_Document_Ingestion` — upload, OCR/LLM QC, extraction maker/checker only |
+| One ingestion BPMN for all countries | `FSS_Payments_Document_Ingestion` — upload, OCR/LLM, single user review |
 | Entity routing **not** in ingestion BPMN | `Trigger_Payment_From_Extraction` fans out via `ExtractionPaymentRouteRegistry` keyed by `entity` |
 | Entry points in entity payment BPMNs | e.g. `IAP_ID_Extraction_Trigger` on `IAP_ID_Payments.bpmn` when `entity=ID` |
 | ZIP bulk upload | One upload row + workflow **per PDF** inside the archive; non-PDF entries ignored |
 | Multi-instruction PDF | LLM returns `initiationDetail[]`; gateway merges `header`; **one payment trigger per instruction** |
 | Extraction service is domain-agnostic | No Camunda, no payment tables — gateway owns workflow |
-| Maker/checker actions via gateway façade | Portal calls `POST .../submit|cancel|approve|reject` — gateway updates DB + `fss_payment_upload_audit`, then WFM server-side |
+| User review actions via gateway façade | Portal calls `POST .../performAction` (`SUBMIT` / `CANCEL`); optional `/submit`/`/cancel` aliases — gateway updates DB + `fss_payment_upload_audit`, then WFM server-side |
 | Phase 1 = sync extract | Gateway blocks on `POST /v1/extract` (~10 min budget, 15 min HTTP envelope) |
 | Phase 1 entity | Indonesia (`entity=ID`) — registry row only |
 
@@ -113,8 +113,8 @@ flowchart LR
 
 | Legacy (v1) | Current (v4) |
 |-------------|----------------|
-| `IDP_Document_Ingestion` | `ESS_Payments_Document_Ingestion` |
-| `IDP_Document_Ingestion.bpmn` | `ESS_Payments_Document_Ingestion.bpmn` |
+| `IDP_Document_Ingestion` | `FSS_Payments_Document_Ingestion` |
+| `IDP_Document_Ingestion.bpmn` | `FSSPaymentsDocIngestion.bpmn` |
 | `fss_idp_*` / `fss_doc_extract_*` | `fss_payment_upload_*` + `fss_payment_data_ingest_details` |
 | `IAP_ID_IDP_Trigger` | `IAP_ID_Extraction_Trigger` |
 | `Initialize_IAP_From_IDP` | `Initialize_IAP_From_Extraction` |
@@ -142,9 +142,9 @@ flowchart LR
 | Component | Status |
 |-----------|--------|
 | `51786-idp-extraction-service` | Built (sync `/v1/extract`, mock mode, `id-payment-v1` template) |
-| `ESS_Payments_Document_Ingestion.bpmn` | In `final/` — ready for workflow-management |
+| `FSSPaymentsDocIngestion.bpmn` | In `final/` — ready for workflow-management |
 | `IAP_ID_Payments.bpmn` additive diff | In repo root `ID_payments.bpmn` |
-| `51786-payment-gateway-service` | Planned — upload APIs + `ExtractionUploadActionService` (maker/checker façade) documented in LLD |
+| `51786-payment-gateway-service` | Planned — upload APIs + `ExtractionUploadActionService` (user review façade) documented in LLD |
 | Portal UI | Specified in UX doc — not built |
 
 ---

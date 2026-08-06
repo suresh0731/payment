@@ -1,8 +1,8 @@
-# ESS Payments Document Ingestion — Production-Safe Design (Two BPMN Files)
+# FSS Payments Document Ingestion — Production-Safe Design (Two BPMN Files)
 
 > **Status:** **Final v5** — entity-only routing, ZIP bulk upload, multi-instruction PDFs (see [README.md](./README.md))  
 > **Created:** 2026-07-30 · **Finalized:** 2026-08-04 · **Updated:** 2026-08-05 (v5 — `entity` replaces `country` as routing key)
-> **Related:** [README.md](./README.md) · [IDP_LLD.md](./IDP_LLD.md) (implementation LLD — routing §4, structured output §6) · [IDP_UX_Design.md](./IDP_UX_Design.md) · [IDP_API_Reference.md](./IDP_API_Reference.md) · [../ID_payments.md](../ID_payments.md) · [../ID_payments.bpmn](../ID_payments.bpmn) · [ESS_Payments_Document_Ingestion.bpmn](./ESS_Payments_Document_Ingestion.bpmn) · [../after_ocr-llm-output.json](../after_ocr-llm-output.json)
+> **Related:** [README.md](./README.md) · [IDP_LLD.md](./IDP_LLD.md) (implementation LLD — routing §4, structured output §6) · [IDP_UX_Design.md](./IDP_UX_Design.md) · [IDP_API_Reference.md](./IDP_API_Reference.md) · [../ID_payments.md](../ID_payments.md) · [../ID_payments.bpmn](../ID_payments.bpmn) · [FSSPaymentsDocIngestion.bpmn](./FSSPaymentsDocIngestion.bpmn) · [../after_ocr-llm-output.json](../after_ocr-llm-output.json)
 
 ---
 
@@ -11,9 +11,9 @@
 | Topic | Decision |
 |-------|----------|
 | BPMN strategy | **Two files** linked by Camunda message correlation |
-| New file | `ESS_Payments_Document_Ingestion.bpmn` — upload, OCR/LLM, extraction maker/checker |
+| New file | `FSSPaymentsDocIngestion.bpmn` — upload, OCR/LLM, single user review |
 | Prod file | `IAP_ID_Payments.bpmn` — **additive only** (4th message start + one init task + merge) |
-| LLM / extraction / human tasks | **Only** in `ESS_Payments_Document_Ingestion.bpmn` |
+| LLM / extraction / human tasks | **Only** in `FSSPaymentsDocIngestion.bpmn` |
 | Existing prod triggers | **Unchanged** — automated, bulk, manual |
 | Cross-process link | Entity-specific message start on each payment BPMN (e.g. `IAP_ID_Extraction_Trigger` when `entity=ID`) + BPMN text annotations |
 | Entity / payment routing | **`ExtractionPaymentRouteRegistry`** + **`EntityExtractionTemplateRegistry`** resolve `entity` → payment message + LLM `templateId` — **not** a BPMN gateway in the ingestion process — see [§2.1](#21-entity--payment-routing-responsibilities) and [IDP_LLD.md §4](./IDP_LLD.md#4-entity-routing--template-config) |
@@ -43,18 +43,15 @@ Camunda passes **`uploadId`** (`fss_payment_upload_meta.id`) only between steps 
 
 ```mermaid
 flowchart TB
-    subgraph ESS["ESS_Payments_Document_Ingestion.bpmn — SINGLE shared process (all countries)"]
+    subgraph FSS["FSSPaymentsDocIngestion.bpmn — SINGLE shared process (all countries)"]
         UP(["Extraction_Upload_Start"]) --> EXTRACT["Trigger_Data_Extraction"]
         EXTRACT --> GW1{"ExtractionResultGateway"}
         GW1 -->|fail| CANCEL["CancelExtractionUpload"]
-        GW1 -->|success| MK["Extraction_MakerReview"]
-        MK --> GW0{"MakerDecisionGateway"}
+        GW1 -->|success| UR["Extraction_UserReview"]
+        UR --> GW0{"UserReviewGateway"}
         GW0 -->|cancel| CANCEL
-        GW0 -->|submit| CK["Extraction_CheckerReview"]
-        CK --> GW2{"ExtractionCheckerGateway"}
-        GW2 -->|reject| MK
-        GW2 -->|approve| TRIGGER["Trigger_Payment_From_Extraction"]
-        TRIGGER --> END_ESS(["Event_Extraction_End"])
+        GW0 -->|submit| TRIGGER["Trigger_Payment_From_Extraction"]
+        TRIGGER --> END_FSS(["Event_Extraction_End"])
     end
 
     subgraph ROUTE["Runtime routing — entity from upload row"]
@@ -79,27 +76,27 @@ flowchart TB
 ```
 
 **Annotation on `IAP_ID_Extraction_Trigger`:**  
-*"Triggered from ESS_Payments_Document_Ingestion via Trigger_Payment_From_Extraction when entity=ID (registry resolves message name). One correlation per initiationDetail."*
+*"Triggered from FSS_Payments_Document_Ingestion via Trigger_Payment_From_Extraction when entity=ID (registry resolves message name). One correlation per initiationDetail."*
 
 **Annotation on `Trigger_Payment_From_Extraction`:**  
 *"External-task hook only — not an entity-routing BPMN gateway. Handler loads extracted_data, fans out one payment message per initiationDetail[], correlates via ExtractionPaymentRouteRegistry."*
 
 ### 2.1 Entity / payment routing responsibilities
 
-`ESS_Payments_Document_Ingestion.bpmn` **is** a decision engine for **ingestion-internal** flow only (extraction success/fail, checker approve/reject, maker submit/cancel). It is **not** the entity/payment routing decision engine.
+`FSSPaymentsDocIngestion.bpmn` **is** a decision engine for **ingestion-internal** flow only (extraction success/fail, user submit/cancel). It is **not** the entity/payment routing decision engine.
 
 > **v5:** `country` and `entity` are the same concept — use **`entity` only** on upload form, DB, Camunda variables, and registry config.
 
 | Layer | Owns entity routing? | Responsibility |
 |-------|----------------------|----------------|
-| `ESS_Payments_Document_Ingestion.bpmn` | **No** | Upload → extract → extraction maker/checker. Gateways: `ExtractionResultGateway`, `MakerDecisionGateway`, `ExtractionCheckerGateway` only. `Trigger_Payment_From_Extraction` is a **single external-task step** — a hook, not a branching gateway. |
+| `FSSPaymentsDocIngestion.bpmn` | **No** | Upload → extract → single user review. Gateways: `ExtractionResultGateway`, `UserReviewGateway` only. `Trigger_Payment_From_Extraction` is a **single external-task step** — a hook, not a branching gateway. |
 | Entity payment BPMN (e.g. `IAP_ID_Payments.bpmn`) | **Defines entry only** | Declares message start events (`IAP_ID_Extraction_Trigger`, future entity-specific names) and `Initialize_*_From_Extraction` merge into existing enrichment. |
 | `ExtractionPaymentRouteRegistry` (gateway config) | **Yes — payment selection** | Maps `entity` from upload row → `messageName` + `processDefinitionKey`. Phase 1: `ID` → `IAP_ID_Extraction_Trigger` / `IAP_ID_Payments`. |
 | `EntityExtractionTemplateRegistry` (gateway config) | **Yes — LLM template** | Maps `entity` → `templateId` for `POST /v1/extract`. Phase 1: `ID` → `id-payment-v1`. |
 | `EntityHandlerRegistry` + `EntityPaymentMapper` | **Yes — handoff mapping** | Jackson POJO → `Payment` / `PaymentData` per entity — see [LLD §6.3](./IDP_LLD.md#63-jackson-pojo-model--entity-mappers-no-mapget-in-v1). |
 | `ExtractionPaymentHandoffHandler` (gateway Java) | **Executes** | On `Trigger_Payment_From_Extraction`: for each instruction, map POJO, save message, `startMessageCorrelation(messageName, businessKey=messageId, ...)`. No per-entity `if` chains in handler code. |
 
-**Principle:** Message names are **declared in entity payment BPMN** (deploy contract). **Which** message and **which** LLM template to use is **selected at runtime** from `entity` via registries. Adding an entity does **not** require changing `ESS_Payments_Document_Ingestion.bpmn` — only registry rows + entity-specific mapper + BPMN message start on that entity's payment process.
+**Principle:** Message names are **declared in entity payment BPMN** (deploy contract). **Which** message and **which** LLM template to use is **selected at runtime** from `entity` via registries. Adding an entity does **not** require changing `FSSPaymentsDocIngestion.bpmn` — only registry rows + entity-specific mapper + BPMN message start on that entity's payment process.
 
 ---
 
@@ -129,17 +126,17 @@ flowchart TB
 
 ---
 
-## 4. BPMN file 1: `ESS_Payments_Document_Ingestion.bpmn` (NEW)
+## 4. BPMN file 1: `FSSPaymentsDocIngestion.bpmn` (NEW)
 
 ### 4.1 Process metadata
 
 | Attribute | Value |
 |-----------|-------|
-| Process ID | `ESS_Payments_Document_Ingestion` |
-| Process name | `ESS Payments Document Ingestion` |
+| Process ID | `FSS_Payments_Document_Ingestion` |
+| Process name | `FSS Payments Document Ingestion` |
 | Executable | `true` |
 | Owning module | `51786-workflow-management` |
-| Deploy file | `ESS_Payments_Document_Ingestion.bpmn` (in `final/`) |
+| Deploy file | `FSSPaymentsDocIngestion.bpmn` (in `final/`) |
 
 ### 4.2 Process flow
 
@@ -148,17 +145,15 @@ flowchart TB
 | Start | `Extraction_Upload_Start` | Plain start | REST upload persists file + triggers `startWorkflowProcess` |
 | Trigger extraction | `Trigger_Data_Extraction` | External | `Trigger_Data_Extraction` |
 | Extraction gateway | `ExtractionResultGateway` | Exclusive | `${extractionStatus=='READY_FOR_REVIEW'}` (default → `CancelExtractionUpload`) |
-| Maker review | `Extraction_MakerReview` | User task | `${paymentMaker}` |
-| Maker gateway | `MakerDecisionGateway` | Exclusive | `${makerAction=='SUBMIT'}` (default → `CancelExtractionUpload`) |
-| Checker review | `Extraction_CheckerReview` | User task | `${paymentChecker}` |
-| Checker gateway | `ExtractionCheckerGateway` | Exclusive | `${extractionApproved==true}` → handoff |
+| User review | `Extraction_UserReview` | User task | `${paymentMaker}` — user edits extracted fields |
+| User review gateway | `UserReviewGateway` | Exclusive | `${reviewAction=='SUBMIT'}` (default → `CancelExtractionUpload`) |
 | Trigger payment(s) | `Trigger_Payment_From_Extraction` | External | `Trigger_Payment_From_Extraction` |
 | End (success) | `Event_Extraction_End` | End event | After all handoffs complete |
-| End (fail/cancel) | `CancelExtractionUpload` | End event | Extraction fail or maker cancel |
+| End (fail/cancel) | `CancelExtractionUpload` | End event | Extraction fail or user cancel |
 
-### 4.3 No BPMN messages inside ingestion process (v3+)
+### 4.3 No BPMN messages inside ingestion process
 
-There are **no boundary events and no `bpmn:message` definitions** in this process. `ExtractionResultGateway` and `MakerDecisionGateway` are evaluated the instant the preceding external/user task completes — the gateway handler completes `Trigger_Data_Extraction` with `extractionStatus`; maker/checker tasks are completed via **gateway façade APIs** (`ExtractionUploadActionService`), not direct portal → workflow-management calls.
+There are **no boundary events and no `bpmn:message` definitions** in this process. `ExtractionResultGateway` and `UserReviewGateway` are evaluated the instant the preceding external/user task completes — the gateway handler completes `Trigger_Data_Extraction` with `extractionStatus`; the user review task is completed via **gateway façade APIs** (`ExtractionUploadActionService`), not direct portal → workflow-management calls.
 
 Extraction service **never** calls Camunda.
 
@@ -215,20 +210,22 @@ See [IDP_LLD.md §7](./IDP_LLD.md#7-error-handling--resilience). Summary:
 | OCR + LLM | idp-extraction-service | `POST /v1/extract` only — **no workflow client** |
 | `Initialize_IAP_From_Extraction` | payment-gateway-service | `IAPExtractionInitializeHandler` |
 
-### 4.7 Gateway-orchestrated maker/checker actions
+### 4.7 Gateway-orchestrated user review actions (`performAction`)
 
 **Problem:** If the portal calls `workflow-management` directly (`setTaskDetails` + `completeCurrentTask`), Camunda advances but `fss_payment_upload_meta`, `fss_payment_data_ingest_details`, and `fss_payment_upload_audit` stay stale — the uploads table shows wrong status and there is no audit trail.
 
-**Solution:** Expose four gateway endpoints (see [IDP_API_Reference.md §3](./IDP_API_Reference.md#3-maker-checker-action-apis--gateway-facade-required)) implemented by `ExtractionUploadActionService`:
+**Solution:** Single gateway endpoint **`POST .../performAction?uploadId={id}`** with body `{ "action": "SUBMIT" | "CANCEL", "remarks": "..." }`, implemented by `ExtractionUploadActionService` (switch / handler map). Optional thin aliases `/submit` and `/cancel` delegate to the same service method.
 
 | UI button | Gateway API | DB + audit (before WFM) | Camunda (server-side) |
 |-----------|-------------|-------------------------|------------------------|
-| Submit to checker | `POST .../submit?uploadId={id}` | meta + all details → `SUBMITTED`; audit `MAKER_SUBMIT` | `Extraction_MakerReview` + `{makerAction:'SUBMIT'}` |
-| Cancel upload | `POST .../cancel?uploadId={id}` | meta + details → `CANCELLED`; audit `MAKER_CANCEL` | `Extraction_MakerReview` + `{makerAction:'CANCEL'}` |
-| Approve | `POST .../approve?uploadId={id}` | meta → `HANDOFF_IN_PROGRESS`; audit `CHECKER_APPROVE` | `Extraction_CheckerReview` + `{extractionApproved:true}` |
-| Reject | `POST .../reject?uploadId={id}` | meta + details → `REJECTED`; audit `CHECKER_REJECT` | `Extraction_CheckerReview` + `{extractionApproved:false}` |
+| Submit for routing | `POST .../performAction` `{ "action": "SUBMIT" }` | meta → `SUBMITTED`; audit `USER_SUBMIT` | `Extraction_UserReview` + `{reviewAction:'SUBMIT'}` |
+| Cancel upload | `POST .../performAction` `{ "action": "CANCEL" }` | meta + details → `CANCELLED`; audit `USER_CANCEL` | `Extraction_UserReview` + `{reviewAction:'CANCEL'}` |
 
-On approve, `ExtractionPaymentHandoffHandler` sets per-detail `message_id`, detail `APPROVED`, and meta `APPROVED` when all correlations succeed. On WFM failure after DB commit, gateway rolls back or leaves status unchanged and returns `502` — see API Reference §3.3.
+**Auth:** `@PreAuthorize` for **`paymentMaker`** on `performAction` (and aliases if implemented).
+
+**Removed (v8):** `/approve`, `/reject`, and ingestion checker actions — not part of `FSSPaymentsDocIngestion.bpmn`.
+
+On submit, meta becomes `SUBMITTED`; `ExtractionPaymentHandoffHandler` sets `TRIGGERING_PAYMENT` while routing, then `COMPLETED` when all `IAP_ID` correlations succeed. Per-detail rows follow the same vocabulary; `message_id` is saved during `TRIGGERING_PAYMENT`. On WFM failure after DB commit, gateway rolls back or leaves status unchanged and returns `502` — see API Reference §3.3.
 
 ---
 
@@ -238,7 +235,7 @@ On approve, `ExtractionPaymentHandoffHandler` sets per-detail `message_id`, deta
 
 | Upload | `Content-Type` / extension | Behaviour |
 |--------|---------------------------|-----------|
-| Single PDF | `application/pdf`, `.pdf` | One `fss_payment_upload_meta` row + one `ESS_Payments_Document_Ingestion` instance |
+| Single PDF | `application/pdf`, `.pdf` | One `fss_payment_upload_meta` row + one `FSS_Payments_Document_Ingestion` instance |
 | ZIP bulk | `application/zip`, `application/x-zip-compressed`, `.zip` | Unpack; **only** `.pdf` entries become uploads; all other entries ignored |
 
 **Rules:**
@@ -333,7 +330,7 @@ The **header is shared** across all instructions in the same PDF. `ExtractionTri
 
 - `header.TotInst` = `initiationDetail.length`.
 - Single-instruction PDFs use an array of length **1** (the fixture [after_ocr-llm-output.json](../after_ocr-llm-output.json) shows the legacy single-object shape; production contract is **always an array**).
-- Maker/checker review the full `{ header, initiationDetail[] }` payload in the UI (see [IDP_UX_Design.md](./IDP_UX_Design.md)).
+- User reviews the full `{ header, initiationDetail[] }` payload in the UI (see [IDP_UX_Design.md](./IDP_UX_Design.md)).
 
 ### 6.4 Multi-instruction PDF fan-out
 
@@ -341,9 +338,9 @@ The **header is shared** across all instructions in the same PDF. `ExtractionTri
 
 ```mermaid
 flowchart TB
-    subgraph ESS["1× ESS_Payments_Document_Ingestion per PDF"]
+    subgraph FSS["1× FSS_Payments_Document_Ingestion per PDF"]
         U[upload_meta.id = businessKey]
-        MK[Maker/Checker review ALL instructions]
+        UR[User review ALL instructions]
         TR[Trigger_Payment_From_Extraction]
     end
     subgraph DET["N× fss_payment_data_ingest_details"]
@@ -356,7 +353,7 @@ flowchart TB
         P2[businessKey = message_id_2]
         PN[businessKey = message_id_N]
     end
-    U --> MK --> TR
+    U --> UR --> TR
     TR --> D1 --> P1
     TR --> D2 --> P2
     TR --> DN --> PN
@@ -371,9 +368,9 @@ FOR each fss_payment_data_ingest_details WHERE upload_id = ? AND message_id IS N
   1. payload = detail.extracted_data
   2. Payment/PaymentData = map(payload)
   3. message_id = MessageService.save(channel=DOC_EXTRACTION)   -- REQUIRED
-  4. UPDATE detail: message_id, payment_workflow_key, handoff_at, handoff_message_name, status=APPROVED
+  4. UPDATE detail: message_id, payment_workflow_key, handoff_at, handoff_message_name, status=TRIGGERING_PAYMENT
   5. startMessageCorrelation(IAP_ID_Extraction_Trigger, businessKey=message_id)
-AFTER all succeed: UPDATE meta status=APPROVED; complete Trigger_Payment_From_Extraction
+AFTER all succeed: UPDATE meta status=COMPLETED; complete Trigger_Payment_From_Extraction
 ```
 
 On failure: set `error_desc`, increment `retry` on failed detail only; do not complete external task.
@@ -383,8 +380,8 @@ On failure: set `error_desc`, increment `retry` on failed detail only; do not co
 ### 6.5 Idempotency
 
 - Before handoff loop: abort if any `fss_payment_data_ingest_details` row for `upload_id` already has `message_id` set
-- On partial failure mid-loop: do **not** complete `Trigger_Payment_From_Extraction`; upload stays `SUBMITTED`; ops alert; retry is safe because completed handoffs are skipped by `message_id` guard per row
-- Double checker approve → no duplicate payment instances
+- On partial failure mid-loop: do **not** complete `Trigger_Payment_From_Extraction`; upload stays `SUBMITTED` or `TRIGGERING_PAYMENT`; ops alert; retry is safe because completed handoffs are skipped by `message_id` guard per row
+- Double user submit → no duplicate payment instances
 
 ---
 
@@ -409,16 +406,17 @@ Payment/PaymentData mapping happens in `ExtractionPaymentHandoffHandler` **befor
 
 ---
 
-## 8. Two maker-checker cycles
+## 8. Extraction review vs payment maker-checker
 
 | Stage | Process | User tasks | Purpose |
 |-------|---------|------------|---------|
-| Extraction QC | `ESS_Payments_Document_Ingestion` | `Extraction_MakerReview`, `Extraction_CheckerReview` | Validate OCR/LLM fields for **all** instructions in the PDF |
+| Extraction review | `FSS_Payments_Document_Ingestion` | `Extraction_UserReview` | User validates/edits OCR/LLM fields for **all** instructions, then submits for routing |
 | Payment QC | `IAP_ID_Payments` | `IAP_ID_MakerPayment`, `IAP_ID_CheckerPayment` | Payment repair / banking approval **per instruction** |
 
-**Routing after extraction checker approves:**
+**Routing after user submits for routing:**
 
-- Set `isApproved=true` at each handoff correlation.
+- `Trigger_Payment_From_Extraction` correlates `IAP_ID_Extraction_Trigger` per instruction.
+- Set `isApproved=true` at each handoff correlation when appropriate.
 - After `Save_Payment_Transaction`, existing `PaymentValidationGateway` may **skip payment checker** when validation is clean.
 - **Do not** reuse `IAP_ID_MakerPayment` for extraction review.
 
@@ -429,9 +427,9 @@ Payment/PaymentData mapping happens in `ExtractionPaymentHandoffHandler` **befor
 | Concept | BPMN | UI action | Change |
 |---------|------|-----------|--------|
 | Manual payment keying | `IAP_ID_Manual_Payment` | User keys payment fields | **No change** |
-| Document upload | `ESS_Payments_Document_Ingestion` start | User uploads PDF or ZIP | **New** — starts ingestion process, not manual payment |
+| Document upload | `FSS_Payments_Document_Ingestion` start | User uploads PDF or ZIP | **New** — starts ingestion process, not manual payment |
 
-Upload REST must call `startWorkflowProcess(processKey=ESS_Payments_Document_Ingestion)`, **not** `IAP_ID_Manual_Payment`.
+Upload REST must call `startWorkflowProcess(processKey=FSS_Payments_Document_Ingestion)`, **not** `IAP_ID_Manual_Payment`.
 
 ---
 
@@ -463,7 +461,7 @@ erDiagram
 | `status` | Per-instruction lifecycle (same vocabulary as meta) |
 | `extracted_data` | CLOB — `{ header, initiationDetail }` per instruction |
 | `confidence_score` | From `Confidence1` |
-| `extraction_workflow_key` | = `upload_id` (ESS process business key) |
+| `extraction_workflow_key` | = `upload_id` (FSS process business key) |
 | `message_id` | **Mandatory** after handoff — FK to `fss_services_message`; IAP business key |
 | `payment_workflow_key` | = `message_id` |
 | `payment_id` | Backfilled after `Save_Payment_Transaction` |
@@ -497,9 +495,9 @@ Full catalog: [IDP_LLD.md §6.2](./IDP_LLD.md#62-real-structuredoutput-shape-ver
 
 | Screen | Process task | Actions |
 |--------|--------------|---------|
-| Upload tab | Starts `ESS_Payments_Document_Ingestion` | Upload PDF **or ZIP**; Cancel |
+| Upload tab | Starts `FSS_Payments_Document_Ingestion` | Upload PDF **or ZIP**; Cancel |
 | Uploads table | — | One row per PDF; `batch_id` filter for ZIP batches; poll while `PROCESSING` |
-| Detail modal | `Extraction_MakerReview` / `Extraction_CheckerReview` | Review all instructions (tabs/accordion); Save; Submit; Approve/Reject |
+| Detail modal | `Extraction_UserReview` | Review all instructions (tabs/accordion); Save draft; Submit for routing; Cancel |
 | Payment detail | `IAP_ID_Payments` | Existing — one link per handoff row |
 
 ---
@@ -509,7 +507,7 @@ Full catalog: [IDP_LLD.md §6.2](./IDP_LLD.md#62-real-structuredoutput-shape-ver
 | Phase | Deliverable | Prod risk |
 |-------|-------------|-----------|
 | P1 | DDL `fss_payment_upload_*` + `fss_payment_data_ingest_details` | None |
-| P2 | `ESS_Payments_Document_Ingestion.bpmn` + gateway upload/extract handlers | None on IAP |
+| P2 | `FSSPaymentsDocIngestion.bpmn` + gateway upload/extract handlers | None on IAP |
 | P3 | Additive deploy `IAP_ID_Payments.bpmn` v(N+1) | Old paths must regression-pass |
 | P4 | Handoff handler + `IAPExtractionInitializeHandler` | None until uploads start |
 | P5 | Portal upload tab | Controlled rollout |
@@ -527,13 +525,13 @@ Full catalog: [IDP_LLD.md §6.2](./IDP_LLD.md#62-real-structuredoutput-shape-ver
 | 1 | Automated (mock JMS) | `Initialize_IAP_Payments` | Yes |
 | 2 | Bulk upload ID | Bulk init → `isApproved=true` path | Yes |
 | 3 | Manual start | `IAP_ID_MakerPayment` directly | Yes |
-| 4 | Single PDF → approve → handoff | 1× `Initialize_IAP_From_Extraction` | New |
-| 5 | Multi-instruction PDF (N=3) → approve | 3× `IAP_ID_Extraction_Trigger` correlated | New |
+| 4 | Single PDF → submit → handoff | 1× `Initialize_IAP_From_Extraction` | New |
+| 5 | Multi-instruction PDF (N=3) → submit | 3× `IAP_ID_Extraction_Trigger` correlated | New |
 | 6 | ZIP with 2 PDFs | 2 upload rows, 2 ingestion instances, shared `batch_id` | New |
 | 7 | ZIP with no PDFs | `400` error | New |
 | 8 | ZIP with PDF + non-PDF | PDFs processed; others in `skippedEntries` | New |
 | 9 | Automated `TO_BE_REPAIR` | `IAP_ID_MakerPayment` | Yes |
-| 10 | Double checker approve | No duplicate payment instances | New |
+| 10 | Double submit | No duplicate payment instances | New |
 
 ---
 
@@ -554,7 +552,7 @@ Full catalog: [IDP_LLD.md §6.2](./IDP_LLD.md#62-real-structuredoutput-shape-ver
 
 ### BPMN
 
-- [ ] Deploy `ESS_Payments_Document_Ingestion.bpmn` in `51786-workflow-management`
+- [ ] Deploy `FSSPaymentsDocIngestion.bpmn` in `51786-workflow-management`
 - [ ] Additive change to `IAP_ID_Payments.bpmn` (4th start + `Initialize_IAP_From_Extraction` + merge)
 - [ ] Verify `Initialize_IAP_ID_Payments` has 3 incomings, none removed
 
