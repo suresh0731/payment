@@ -1,7 +1,7 @@
 # FSS Payments Document Ingestion — Production-Safe Design (Two BPMN Files)
 
-> **Status:** **Final v5** — entity-only routing, ZIP bulk upload, multi-instruction PDFs (see [README.md](./README.md))  
-> **Created:** 2026-07-30 · **Finalized:** 2026-08-04 · **Updated:** 2026-08-05 (v5 — `entity` replaces `country` as routing key)
+> **Status:** **Final v6** — entity-only routing, ZIP bulk upload, multi-instruction PDFs; gateway-owned `header`; re-extract removed (`FAILED` terminal); three confidence scopes; file status folded from instruction statuses (see [README.md](./README.md))  
+> **Created:** 2026-07-30 · **Finalized:** 2026-08-04 · **Updated:** 2026-08-05 (v5 — `entity` replaces `country` as routing key) · **Corrected:** 2026-08-10 (v6)
 > **Related:** [README.md](./README.md) · [IDP_LLD.md](./IDP_LLD.md) (implementation LLD — routing §4, structured output §6) · [IDP_UX_Design.md](./IDP_UX_Design.md) · [IDP_API_Reference.md](./IDP_API_Reference.md) · [../ID_payments.md](../ID_payments.md) · [../ID_payments.bpmn](../ID_payments.bpmn) · [FSSPaymentsDocIngestion.bpmn](./FSSPaymentsDocIngestion.bpmn) · [../after_ocr-llm-output.json](../after_ocr-llm-output.json)
 
 ---
@@ -21,17 +21,20 @@
 | Manual payment keying | `IAP_ID_Manual_Payment` stays as-is; document upload is a **separate** process |
 | Upload formats | **Single PDF** or **ZIP of PDFs** (bulk upload). Only `.pdf` entries are processed; other ZIP members are ignored |
 | Multi-instruction PDF | One PDF may contain **N** payment instructions. LLM returns **`initiationDetail` as an array only**; gateway merges the shared `header` at persist and at handoff |
-| Document storage (Phase 1) | **Three tables** — `fss_payment_upload_content` (BLOB) + `fss_payment_upload_meta` (file metadata) + `fss_payment_data_ingest_details` (per instruction, incl. `retry` / `error_desc`); lazy-fetched; **no** document-service |
-| Extraction naming | **`extracted_data`** on `fss_payment_data_ingest_details` — one row per instruction; re-extract resets detail rows in place |
-| Confidence | Per-field `Confidence` in LLM JSON (strings); `overall_confidence` on workflow mapping row |
+| Document storage (Phase 1) | **Three tables** — `fss_payment_upload_content` (PDF bytes as `BYTEA`) + `fss_payment_upload_meta` (file metadata) + `fss_payment_data_ingest_details` (per instruction, incl. `retry` / `error_desc`); lazy-fetched; **no** document-service |
+| Extraction naming | **`extracted_data`** on `fss_payment_data_ingest_details` — one row per instruction, written once and never reset |
+| Retry after failure | **Re-upload, not re-extract.** There is no re-extract endpoint, button, or status edge; `FAILED` is terminal and the maker uploads the document again ([IDP_LLD.md §7.3](./IDP_LLD.md#73-re-extract--dropped-from-v1-the-workaround-is-to-upload-the-document-again)) |
+| Header ownership | **The gateway builds `header`**, not the extraction service. The service returns `initiationDetail` only ([§6.3](#63-llm-output-vs-stored-structured_output)) |
+| Confidence | **Three scopes, all from the extraction payload** — file (`fss_payment_upload_meta.confidence`), instruction (`confidence_score`), field (inside each `{ Name, Value, Confidence }` triple). The file score is **not** an average of the instruction scores ([§6.3](#63-llm-output-vs-stored-structured_output)) |
 | BPMN orchestration (v3+) | **No BPMN messages** inside the ingestion process — extraction result and maker Submit/Cancel are plain exclusive-gateway decisions evaluated when the preceding task completes |
 
 ### 1.1 Domain glossary
 
 | Term | Meaning |
 |------|---------|
-| **Upload (meta)** | `fss_payment_upload_meta` — one row per PDF; `id` = Camunda business key; links to BLOB via `file_content_id` |
+| **Upload (meta)** | `fss_payment_upload_meta` — one row per PDF; `id` = Camunda business key; links to the stored bytes via `file_content_id` |
 | **Batch** | Shared `batch_id` on meta for ZIP-derived PDFs |
+| **File ID** | One unique business ID `YYENTYXXXXX` per identified PDF — year + Level-1 access code + system sequence |
 | **Upload content** | `fss_payment_upload_content` — PDF bytes (lazy-fetched) |
 | **Ingest detail** | `fss_payment_data_ingest_details` — one row per instruction: `extracted_data`, `status`, `retry`, `error_desc`, workflow keys |
 
@@ -167,28 +170,36 @@ Extraction service **never** calls Camunda.
 #### `ExtractionTriggerHandler` sequence (Phase 1 sync)
 
 ```
-1. Load blob; set fss_payment_upload_meta.status=PROCESSING; detail rows PROCESSING
+1. Load blob; set fss_payment_upload_meta.status=PROCESSING
+   (no detail rows exist yet — they are created from the extraction result)
 2. POST /v1/extract (sync; gateway read-timeout 15 min, Camunda lock PT15M)
 3. On HTTP 200 + valid JSON:
      - LLM returns { "initiationDetail": [ ... ] } only
-     - Gateway builds header (§6.3), INSERTs one fss_payment_data_ingest_details row per instruction
-     - UPDATE meta: status=READY_FOR_REVIEW; INSERT audit EXTRACT_COMPLETE
+     - Gateway builds header (§6.3), INSERTs one fss_payment_data_ingest_details row
+       per instruction, each born READY_FOR_REVIEW
+     - refresh(uploadId) → folds child statuses into meta.status (= READY_FOR_REVIEW)
+     - INSERT audit EXTRACT_COMPLETE
      - complete(Trigger_Data_Extraction, extractionStatus=READY_FOR_REVIEW)
 4. On HTTP 422 / timeout / invalid JSON:
-     - UPDATE meta + details: status=FAILED, error_desc populated; INSERT audit EXTRACT_FAILED
+     - UPDATE meta: status=FAILED, error_desc populated; INSERT audit EXTRACT_FAILED
+       (there are no detail rows to update — the failure is file-level by definition)
      - complete(Trigger_Data_Extraction, extractionStatus=FAILED) OR fail external task
 ```
+
+**Step 1 no longer touches detail rows, and step 4 cannot.** Detail rows are inserted *from* the extraction result, so at step 1 there are none and an extraction that never returns produces none. This is why `PROCESSING` exists only on the file and never on an instruction ([IDP_LLD.md §5.3](./IDP_LLD.md#53-status-lifecycle)) — earlier revisions of this pseudo-code set detail rows to `PROCESSING`, describing rows that do not exist at that point.
+
+**Step 3 writes `meta.status` through the fold, not directly.** `ExtractionUploadAggregateService.refresh` is the only writer of that column, so the file status can never disagree with the rows beneath it — which matters later, when a partially handed-off file has children in different states.
 
 #### Failure & shutdown scenarios (Phase 1)
 
 | Scenario | System state | Recovery |
 |----------|--------------|----------|
-| Extraction service down / timeout | Detail rows `FAILED` or meta `PROCESSING`; Camunda task not completed | `ExternalTaskHelper` retries; after max → `FAILED` |
+| Extraction service down / timeout | Meta `PROCESSING`, **no detail rows**; Camunda task not completed | `ExternalTaskHelper` retries; after max → meta `FAILED`. The maker's recourse is a fresh upload — there is no re-extract (§1) |
 | Gateway crashes during HTTP call | Camunda lock expires; upload `PROCESSING` | Re-claim task; idempotent via `idp_extraction_audit` / `GET /v1/extract/{extractionId}` |
 | Gateway saves DB but complete fails | Rows `READY_FOR_REVIEW`, Camunda stuck before gateway | Reconciliation: re-complete `Trigger_Data_Extraction` with `extractionStatus=READY_FOR_REVIEW` |
 | Duplicate handler (lock race) | Two workers same upload | Guard on detail `status`; second worker no-ops or loads existing result |
 
-**Source of truth for UI:** `fss_payment_upload_meta.status` + `fss_payment_data_ingest_details.status` (and audit trail in `fss_payment_upload_audit`), not Camunda alone.
+**Source of truth for UI:** `fss_payment_upload_meta.status` + `fss_payment_data_ingest_details.status` (action trail in `fss_payment_upload_audit`, field-level edit trail in `fss_payment_field_audit`), not Camunda alone.
 
 ### 4.5 Timeout configuration (10 min OCR+LLM budget)
 
@@ -243,7 +254,11 @@ On submit, meta becomes `SUBMITTED`; `ExtractionPaymentHandoffHandler` sets `TRI
 - ZIP is a **bulk upload convenience** — each PDF inside is a **separate** upload row and workflow instance.
 - Non-PDF files inside a ZIP (`.xlsx`, `.txt`, folders, `__MACOSX`, etc.) are **skipped** without failing the whole batch.
 - ZIP with **zero** PDF entries → `400 Bad Request` ("No PDF files found in archive").
-- All PDFs from one ZIP share the same `batch_id` (UUID generated at upload time).
+- All PDFs from one ZIP share the same `batch_id` (UUIDv7 generated at upload time).
+- Every identified PDF receives its own File ID `YYENTYXXXXX`: `YY` from the upload timestamp year, `ENTY` from the user's Level-1 access (`IDJY` for Indonesia, configuration-driven for later rollouts), `XXXXX` from a sequence scoped to that `(year, ENTY)` and restarted each year.
+- Sort all identified PDFs by file upload timestamp ascending and allocate sequence values in that order. Equal timestamps use normalized ZIP source path, then discovery order, as deterministic tie-breakers.
+- The sequence is padded to five digits but not limited to five: after `99999` it continues at `100000`, so no rollout ever exhausts the format ([LLD §5.1.1](./IDP_LLD.md#511-file-id-generation)).
+- File ID—not file name—is the per-file identity. PDFs with the same base name in different ZIP folders receive different File IDs.
 - Only extracted PDF content is persisted in `fss_payment_upload_content` (referenced by meta `file_content_id`).
 
 ### 5.2 REST upload response
@@ -252,7 +267,8 @@ On submit, meta becomes `SUBMITTED`; `ExtractionPaymentHandoffHandler` sets `TRI
 
 ```json
 {
-  "extractionUploadId": "a1b2c3d4-...",
+  "uploadId": "a1b2c3d4-...",
+  "fileId": "26IDJY00001",
   "uploadStatus": "PROCESSING"
 }
 ```
@@ -263,14 +279,19 @@ On submit, meta becomes `SUBMITTED`; `ExtractionPaymentHandoffHandler` sets `TRI
 {
   "batchId": "batch-uuid",
   "uploads": [
-    { "extractionUploadId": "...", "fileName": "doc1.pdf", "uploadStatus": "PROCESSING" },
-    { "extractionUploadId": "...", "fileName": "doc2.pdf", "uploadStatus": "PROCESSING" }
+    { "uploadId": "...", "fileId": "26IDJY00002", "fileName": "doc1.pdf", "sourcePath": "folder-a/doc1.pdf", "uploadStatus": "PROCESSING" },
+    { "uploadId": "...", "fileId": "26IDJY00003", "fileName": "doc1.pdf", "sourcePath": "folder-b/doc1.pdf", "uploadStatus": "PROCESSING" }
   ],
-  "skippedEntries": ["readme.txt", "summary.xlsx"]
+  "skippedEntries": [
+    { "path": "readme.txt", "reason": "NOT_PDF" },
+    { "path": "summary.xlsx", "reason": "NOT_PDF" }
+  ]
 }
 ```
 
 Each item in `uploads` appears as its own row in the uploads table (filterable by `batchId`).
+
+**The id field is `uploadId` in both shapes.** An earlier revision named it `extractionUploadId` on the single-PDF response while the ZIP response already used `uploadId`, so a client had to branch on the upload type to find the same value. `extractionUploadId` survives only as the **Camunda variable** name (§6.2) — it is not a REST field on any endpoint.
 
 ---
 
@@ -313,7 +334,7 @@ The extraction service LLM step returns **only** the instruction list:
 }
 ```
 
-The **header is shared** across all instructions in the same PDF. `ExtractionTriggerHandler` builds it once from OCR/job context and merges before persisting:
+The **header is shared** across all instructions in the same PDF, and the **gateway** builds it — the extraction service never returns one. Every value in it is data the gateway already owns (upload metadata, entity, document ids) or derives from the instruction array it just received, so asking the model to reproduce it would invite hallucinated values in fields that are authoritative elsewhere, with no way to tell a wrong header from a right one. `ExtractionTriggerHandler` builds it once and merges before persisting:
 
 ```json
 {
@@ -328,9 +349,17 @@ The **header is shared** across all instructions in the same PDF. `ExtractionTri
 }
 ```
 
-- `header.TotInst` = `initiationDetail.length`.
-- Single-instruction PDFs use an array of length **1** (the fixture [after_ocr-llm-output.json](../after_ocr-llm-output.json) shows the legacy single-object shape; production contract is **always an array**).
-- User reviews the full `{ header, initiationDetail[] }` payload in the UI (see [IDP_UX_Design.md](./IDP_UX_Design.md)).
+The merged shape above is a **transient, document-scoped intermediate** that exists only inside `ExtractionTriggerHandler`. It is never stored as one blob. The handler immediately fans it out into one row per instruction, each storing a **singular** `initiationDetail`:
+
+```json
+{ "header": { "…identical in all N rows…" }, "initiationDetail": { "…one element…" } }
+```
+
+- **`header.TotInst` cannot disagree with `initiationDetail.length`, because the gateway computes it from that array rather than reading it from the model.** Earlier drafts treated `TotInst` as an LLM-produced string and specified a mismatch warning; with the header moved to the gateway there is no second source to reconcile, and the reconciliation rule is retired. The same applies to `InstructionSummary` counts, which are rolled up from the persisted rows — see [IDP_LLD.md §6.1b](./IDP_LLD.md#61b-the-gateway-builds-the-header).
+- Single-instruction PDFs use an array of length **1** (the fixture [after_ocr-llm-output.json](../after_ocr-llm-output.json) shows the legacy single-object shape; production contract is **always an array**). *N*=1 is not a special case in code.
+- The header is copied into every row deliberately, so each row is self-contained. It is therefore **read-only in review** — editing it on one row would desync the other *N*−1.
+- **Confidence exists at three scopes**: document (`fss_payment_upload_meta.confidence`), instruction (`Confidence1` → `fss_payment_data_ingest_details.confidence_score`), and field (the `Confidence` in each `{ Name, Value, Confidence }` triple, never a column). See [IDP_LLD.md §6.4](./IDP_LLD.md#64-confidence--three-scopes-three-homes).
+- The review modal shows the document header once and **one section per instruction row**, so the user sees the equivalent of `{ header, initiationDetail[] }` even though it is assembled from *N* rows (see [IDP_UX_Design.md](./IDP_UX_Design.md)). Each edit targets a single row, but **Save draft** is a file-level button, so one request carries every dirty row (see [IDP_API_Reference.md §2.5](./IDP_API_Reference.md#25-post-apifsspaymentsgatewayv1extraction-uploadsfieldsuploadidid)).
 
 ### 6.4 Multi-instruction PDF fan-out
 
@@ -368,12 +397,18 @@ FOR each fss_payment_data_ingest_details WHERE upload_id = ? AND message_id IS N
   1. payload = detail.extracted_data
   2. Payment/PaymentData = map(payload)
   3. message_id = MessageService.save(channel=DOC_EXTRACTION)   -- REQUIRED
-  4. UPDATE detail: message_id, payment_workflow_key, handoff_at, handoff_message_name, status=TRIGGERING_PAYMENT
+  4. UPDATE detail: message_id, payment_workflow_key, handoff_message_name, status=TRIGGERING_PAYMENT
   5. startMessageCorrelation(IAP_ID_Extraction_Trigger, businessKey=message_id)
-AFTER all succeed: UPDATE meta status=COMPLETED; complete Trigger_Payment_From_Extraction
+  6. UPDATE detail: status=COMPLETED
+AFTER each row, and again at the end: refresh(uploadId) folds child statuses into meta.status
+THEN: complete Trigger_Payment_From_Extraction
 ```
 
 On failure: set `error_desc`, increment `retry` on failed detail only; do not complete external task.
+
+**`meta.status` is never assigned `COMPLETED` here — it is folded.** Handing off eighteen instructions means eighteen row transitions, and the file is only `COMPLETED` once the last one lands; until then the fold yields `TRIGGERING_PAYMENT` because that state outranks `COMPLETED` ([IDP_LLD.md §5.3.2](./IDP_LLD.md#532-the-fold--how-metastatus-is-derived-from-its-children)). Writing the file status directly at the end of the loop is what would let a crash halfway through leave a file reading `COMPLETED` over rows that never handed off — the exact state reconciliation cannot distinguish from success.
+
+`retry` in this loop is the **only** thing that increments it: it counts handoff attempts, never extraction attempts, because extraction is never retried at the application level (§1).
 
 **UI:** uploads table = 1 row per PDF; detail modal = master–detail for 10–20 instructions (see [IDP_UX_Design.md §4](./IDP_UX_Design.md#4-detail-modal--multi-instruction-review-1020-per-file)).
 
@@ -402,7 +437,7 @@ On failure: set `error_desc`, increment `retry` on failed detail only; do not co
 |------|-------|---------|----------------|
 | `Initialize_IAP_From_Extraction` | `Initialize_IAP_From_Extraction` | `IAPExtractionInitializeHandler` | Load pre-created `fss_services_message` by `messageId` (business key); confirm enriched payload; flow continues to `Initialize_IAP_ID_Payments` |
 
-Payment/PaymentData mapping happens in `ExtractionPaymentHandoffHandler` **before** correlation — see [IDP_LLD.md §6.3](./IDP_LLD.md#63-iapextractioninitializehandler-mapping-algorithm-proposed).
+Payment/PaymentData mapping happens in `ExtractionPaymentHandoffHandler` **before** correlation — see [IDP_LLD.md §6.3](./IDP_LLD.md#63-jackson-pojo-model--entity-mappers-no-mapget-in-v1).
 
 ---
 
@@ -435,13 +470,15 @@ Upload REST must call `startWorkflowProcess(processKey=FSS_Payments_Document_Ing
 
 ## 10. Database design (summary)
 
-Full DDL in [IDP_LLD.md §5](./IDP_LLD.md#5-database-design-manual-sql-no-liquibase).
+Full PostgreSQL DDL in [IDP_LLD.md §5](./IDP_LLD.md#5-database-design-postgresql-manual-sql-no-liquibase).
+
+**Surrogate keys** owned by this feature are native `UUID` columns holding **UUIDv7** values — time-ordered, so they index like a sequence without being guessable in the REST API. Keys owned by other systems (`message_id`, `payment_workflow_key`, `extraction_id`) keep their existing types. See [IDP_LLD.md §5.1.3](./IDP_LLD.md#513-surrogate-keys--native-uuid-generated-as-uuidv7).
 
 ### 10.1 Three-table model
 
 | Table | Granularity | Role |
 |-------|-------------|------|
-| `fss_payment_upload_content` | Per file | BLOB only (`id`, `file_content`) |
+| `fss_payment_upload_content` | Per file | PDF bytes only (`id`, `file_content BYTEA`) |
 | `fss_payment_upload_meta` | Per PDF | File metadata, `status`, `file_content_id`, upload audit (`uploaded_by`, `uploaded_at`, `processed_at`); optional `batch_id` for ZIP |
 | `fss_payment_data_ingest_details` | Per instruction | One row per `initiationDetail` — `extracted_data`, `status`, `confidence_score`, workflow keys, **`retry`**, **`error_desc`** |
 
@@ -455,20 +492,18 @@ erDiagram
 
 | Column | Notes |
 |--------|-------|
-| `id` | PK |
-| `upload_id` | FK → `fss_payment_upload_meta.id` |
+| `id` | PK — native `UUID`, generated as UUIDv7 |
+| `upload_id` | FK → `fss_payment_upload_meta.id`; **also** the FSS ingestion process business key — there is no separate `extraction_workflow_key` column |
 | `instruction_index` | 0-based; unique with `upload_id` |
-| `status` | Per-instruction lifecycle (same vocabulary as meta) |
-| `extracted_data` | CLOB — `{ header, initiationDetail }` per instruction |
+| `status` | Per-instruction lifecycle. Same vocabulary as meta **minus** `UPLOADED` and `PROCESSING` — rows are not created until extraction returns, so those two states exist only on the file. `fss_payment_upload_meta.status` is a **fold** over these values, not an independent column ([IDP_LLD.md §5.3.2](./IDP_LLD.md#532-the-fold--how-metastatus-is-derived-from-its-children)) |
+| `extracted_data` | `TEXT` — `{ header, initiationDetail }` per instruction |
 | `confidence_score` | From `Confidence1` |
-| `extraction_workflow_key` | = `upload_id` (FSS process business key) |
 | `message_id` | **Mandatory** after handoff — FK to `fss_services_message`; IAP business key |
 | `payment_workflow_key` | = `message_id` |
-| `payment_id` | Backfilled after `Save_Payment_Transaction` |
-| `handoff_at` / `handoff_message_name` | Audit when correlation succeeded |
-| `tx_ref`, `sub_activity_id`, `activity_id`, `trn_typ`, … | Denormalized for instruction list UI (no CLOB parse) |
-| `retry` | Default 0; incremented on re-extract / failed handoff retry |
-| `error_desc` | Failure reason; cleared on re-extract |
+| `handoff_message_name` | Which registry message was resolved at correlation |
+| `trn_typ` | Transaction type — the **only** business field promoted to a column, used to group instructions. All other display fields are parsed from `extracted_data` on read |
+| `retry` | Default 0; incremented on a **failed payment handoff** only. With re-extract removed it is never an extraction-attempt counter, and nothing resets it |
+| `error_desc` | Failure reason. **Never cleared** — `FAILED` is terminal, so the reason stays as the record of what happened |
 
 ### 10.3 Existing tables (usage only)
 
@@ -487,7 +522,7 @@ Handler: `ExtractionStructuredOutputMapper` (invoked from `ExtractionPaymentHand
 - Debit/credit legs: `DebitDetails.details[].data[]`, `CreditDetails.details[].data[]`.
 - `header.doc_ids[0]` → document linkage; `header.uniqueId` → external ref candidate.
 
-Full catalog: [IDP_LLD.md §6.2](./IDP_LLD.md#62-real-structuredoutput-shape-verbatim-confirmed-against-the-built-fixture).
+Full catalog: [IDP_LLD.md §6.2](./IDP_LLD.md#62-structuredoutput-shape).
 
 ---
 
@@ -514,7 +549,7 @@ Full catalog: [IDP_LLD.md §6.2](./IDP_LLD.md#62-real-structuredoutput-shape-ver
 
 **Deploy order:** tables → ingestion BPMN + gateway handlers → payment BPMN additive version → UI.
 
-**Rollback:** disable upload route (`extraction-upload.enabled=false`); IAP automated/bulk/manual unaffected.
+**Rollback:** disable the upload route with **`extraction.upload.enabled=false`** — the single canonical kill-switch key ([IDP_LLD.md §4.1](./IDP_LLD.md#41-applicationyml-configuration)); the `extraction-upload.enabled` spelling used in earlier drafts is retired. Because it is read at startup via `@ConditionalOnProperty`, the route disappears rather than returning errors, and the change needs a restart. IAP automated/bulk/manual flows are unaffected.
 
 ---
 
@@ -569,6 +604,7 @@ Full catalog: [IDP_LLD.md §6.2](./IDP_LLD.md#62-real-structuredoutput-shape-ver
 ### Database
 
 - [ ] `fss_payment_upload_content` + `fss_payment_upload_meta` + `fss_payment_data_ingest_details` (incl. `retry`, `error_desc`)
+- [ ] PostgreSQL DDL applied (`V1`–`V5`); confirm no entity uses `@Lob` (it maps to `oid`, not `BYTEA`/`TEXT`)
 
 ### UI
 
@@ -585,13 +621,14 @@ Full catalog: [IDP_LLD.md §6.2](./IDP_LLD.md#62-real-structuredoutput-shape-ver
 | 2026-07-30 | Initial version — two BPMN files, prod-safe additive IAP change |
 | 2026-08-02 | Phase 1 sync extract; country routing registry; moved to `final/` |
 | 2026-08-04 | **v5** — Three-table schema (`fss_payment_upload_*`, `fss_payment_data_ingest_details`); `retry` + `error_desc` on details |
+| 2026-08-10 | **v6** — Header ownership moved to the gateway, so `TotInst` is computed from `initiationDetail.size()` and the compare-and-warn reconciliation rule is retired. Re-extract removed: `FAILED` is terminal, `retry` counts payment-handoff attempts only, `error_desc` is never cleared, and retry means re-uploading the document. Confidence documented as three payload-sourced scopes rather than a computed average. Instruction `status` restricted to the six reachable values, with `fss_payment_upload_meta.status` defined as a fold over them. Kill-switch spelling corrected to `extraction.upload.enabled` |
 
 ---
 
 ## 18. Open questions
 
 - Max PDF count per ZIP and max uncompressed size?
-- Partial handoff policy if instruction 2 of 3 fails to correlate?
+- ~~Partial handoff policy if instruction 2 of 3 fails to correlate?~~ **Answered:** the file folds to `FAILED` while the instructions that already correlated stay `COMPLETED` — successful payments are never rolled back, and the file status makes it visible that something needs attention ([IDP_LLD.md §5.3.2](./IDP_LLD.md#532-the-fold--how-metastatus-is-derived-from-its-children) rule B1).
 - UI layout for reviewing 5+ instructions in one modal?
-- PII retention policy for OCR/LLM CLOB payloads?
+- PII retention policy for OCR/LLM JSON payloads?
 - SSTM feedback behavior for `channel=DOC_EXTRACTION` payments?
