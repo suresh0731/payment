@@ -1,4 +1,4 @@
-# Repo scan prompt — Field edit patch (path, catalog, projections, downstream validation)
+# Repo scan prompt — Field edit patch (field spec, projections, downstream validation)
 
 Run this in a workspace that contains the **implemented** ingestion code (`51786-payment-gateway-service` and related repos), not only `final/` markdown.
 
@@ -12,17 +12,17 @@ Copy everything between the markers.
 
 === BEGIN PROMPT ===
 
-You are preparing to **patch** the existing Document Ingestion field-edit path so it matches `final/IDP_Field_Edit_Design.md` (GET flattened `fields[]`, path addressing, catalog-driven walker, ingest-column projections, downstream DTO validation before persist).
+You are preparing to **patch** the existing Document Ingestion field-edit path so it matches `final/IDP_Field_Edit_Design.md` (GET flattened `fields[]`, `{ fieldGroup, fieldName, occurrenceIndex }` addressing, field-spec YAML walker, ingest-column projections, downstream DTO validation before persist).
 
 Canonical companions (do not re-litigate ingestion as a whole):
 
-- `final/IDP_Field_Edit_Design.md` — **this patch is source of truth** for GET `fields[]`, `path[]`, catalog, projections, gates A–B
+- `final/IDP_Field_Edit_Design.md` — **this patch is source of truth** for GET `fields[]`, field spec (`extraction.field-specs`), projections, gates A–B. Client never sends `path`.
 - `final/IDP_LLD.md` — existing services, DDL, `ExtractionFieldEditService`, audit
 - `final/IDP_API_Reference.md` §2.4 and §2.5 — current `getDetail` / `fields` contract
 - `final/IDP_UX_Design.md` — Save draft UX; whether the modal already walks `extractedData`
 - Fixture: `after_ocr-llm-output.json` (and any multi-instruction fixture you find)
 
-**Do not write or modify production code in this pass.** Ground the patch in what exists. Where the repo contradicts the field-edit design, the **repo wins for names/types/columns**; record the contradiction so the design file can be edited before coding. Where the repo still uses `occurrenceIndex`, that is expected — the patch replaces it.
+**Do not write or modify production code in this pass.** Ground the patch in what exists. Where the repo contradicts the field-edit design, the **repo wins for names/types/columns**; record the contradiction so the design file can be edited before coding. Where the repo still uses `occurrenceIndex`, that is expected — **keep it** for repeating YAML paths. Reject a client-supplied `path`.
 
 ## 0. How to work
 
@@ -42,7 +42,7 @@ Canonical companions (do not re-litigate ingestion as a whole):
 | getDetail assembler | `getDetail`, `IngestDetailSummaryDto`, `extractedData` | Must add `fields[]` via accessor `list()`; confirm UI today parses triples from `extractedData` |
 | Request DTO | `occurrenceIndex`, `fieldGroup`, `fieldName`, `fieldValue`, `section`, `legIndex` | Exact JSON the portal already sends |
 | Accessor | `ExtractedDataFieldAccessor`, `IdExtractedDataFieldAccessor` | Whether `details[].data[]` is hardcoded |
-| Catalog | `FieldGroupCatalog`, `IdFieldGroupCatalog` | Java vs YAML; field name lists |
+| Field spec | `FieldGroupCatalog`, `IdFieldGroupCatalog`, `extraction.field-specs` | Java vs YAML; replace with `EntityFieldSpec` / `EntityFieldSpecRegistry` |
 | Registry | `EntityFieldAccessorRegistry` | How entity is resolved on save |
 | Codec | `ExtractedDataCodec`, `StoredExtractedData` | Gate A target type |
 | Audit write | `ExtractionFieldAuditService`, `fss_payment_field_audit`, `FIELD_EDIT` | Columns including `occurrence_index` |
@@ -82,7 +82,7 @@ Canonical companions (do not re-litigate ingestion as a whole):
 
 | What | Why |
 |------|-----|
-| `extraction.*` in `application.yml` | Where to add `field-catalogs` |
+| `extraction.*` in `application.yml` | Where to add `field-specs` |
 | Existing `@ConfigurationProperties` records | Match constructor binding |
 | Second entity besides `ID` | Whether a second accessor already exists |
 
@@ -96,7 +96,7 @@ Find tests for field edit, accessor, audit, ingest entity. List class names. Not
 - Confirm save is **one transaction** with JSON + audit (or report if audit is after-commit).
 - Confirm `header` is not writable today (denylist vs root-at-`initiationDetail`).
 - Confirm whether `data[]` is addressed by `Name` or by array index in current code.
-- List every `if ("DebitDetails")` / `.getDetails().get(i).getData()` in the edit path — these become catalog.
+- List every `if ("DebitDetails")` / `.getDetails().get(i).getData()` in the edit path — these become field-spec YAML.
 - Confirm Java / Hibernate / validation API versions only if they block records or `jakarta.validation`.
 
 ## 3. Deliverable A — Current vs target
@@ -106,10 +106,10 @@ Table:
 | Area | Current (path:line) | Target (`IDP_Field_Edit_Design.md`) | Patch action |
 |------|---------------------|--------------------------------------|--------------|
 | getDetail | | `ingestDetails[].fields[]` via accessor `list()` | |
-| Request DTO | | echo of GET `{ fieldGroup, path, fieldName, fieldValue }` | |
-| Accessor | | `list()` + `setValue()` | |
-| Catalog | | YAML `extraction.field-catalogs.ID` | |
-| Audit columns | | `field_path`; no `occurrence_index` | |
+| Request DTO | | echo of GET `{ fieldGroup, fieldName, occurrenceIndex, fieldValue }` — no `path` | |
+| Accessor | | `FieldSpecAccessor.list()` + `setValue()` | |
+| Field spec | | YAML `extraction.field-specs.ID` | |
+| Audit columns | | keep `occurrence_index`; optional server-computed `field_path` | |
 | Ingest columns | | projector map | |
 | Mapper validate | | Gate A / Gate B | |
 | Portal grid | | bind GET `fields[]`; do not walk `extractedData` | |
@@ -119,7 +119,7 @@ Then for each **new** type in design §9: Reuse | Extend | New, with package bas
 
 Fill a **column inventory**:
 
-| DB column | On entity? | Written where today? | Catalog `column:` candidate? | Notes |
+| DB column | On entity? | Written where today? | Field-spec `column:` candidate? | Notes |
 |-----------|------------|----------------------|------------------------------|-------|
 
 Fill a **DTO inventory**:
@@ -155,8 +155,8 @@ Acceptance: named test, or “Save draft of `ClntNm` against fixture updates JSO
 Include:
 
 - Apply Deliverable E into `IDP_Field_Edit_Design.md` (DTO/column names) **before** Java.
-- Dual-run or drop `occurrenceIndex` (from portal + API together).
-- `getDetail` `fields[]` and Save draft in the **same** release (portal cannot build `path[]` from raw JSON).
+- Keep `occurrenceIndex` on the wire for repeating YAML paths; reject client `path`.
+- `GET .../details` `fields[]` and Save draft in the **same** release (portal must not walk `extractedData`).
 - Projector wired on **insert and save**.
 - Tests from design §11 (including GET flatten and GET→POST echo).
 
@@ -174,7 +174,7 @@ Must include:
 
 - Exact downstream type name for Gate B.
 - Exact ingest column names (or “do not project client_name”).
-- Whether `FieldGroupCatalog` already exists and should be replaced or adapted.
+- Whether `FieldGroupCatalog` already exists and should be replaced by `EntityFieldSpec` / `FieldSpecAccessor`.
 - Fixture vs stored `extracted_data` (header present? `initiationDetail` object vs array on the row).
 
 ## 8. Output rules
@@ -192,4 +192,4 @@ Must include:
 1. Apply **Deliverable E** to `IDP_Field_Edit_Design.md` (and API §2.5 / LLD §5.5 if those files are still the published contract).
 2. Resolve every **Blocker**.
 3. Implement **Deliverable C** in order. Keep `ExtractionFieldEditService` as the only persist path.
-4. Do not ship API `path[]` without the portal change in the same release if the UI is already on `occurrenceIndex`.
+4. Do not put `path` on GET/POST. Portal stays on `{ fieldGroup, fieldName, occurrenceIndex }`; YAML holds the walk.
