@@ -1,0 +1,32 @@
+extraction:
+  field-catalogs:
+    ID:
+      groups:
+        TransactionDetails:
+          kind: triple-list
+          fields:
+            ClntNm:
+              kind: triple
+              path: []
+              column: client_name          # entity.clientName
+            TrnTyp:
+              kind: triple
+              path: []
+              column: trn_typ
+            TrnRef:
+              kind: triple
+              path: []
+              column: transaction_ref      # only if you persist this
+        DebitDetails:
+          fields:
+            DrAccNo:
+              kind: triple
+              path: [{ key: details, repeating: true }]
+              triples-at: data
+              # no column — not a row-level summary
+            DrAmt:
+              kind: triple
+              path: [{ key: details, repeating: true }]
+              triples-at: data
+              column: debit_amount
+              occurrence: 0              # only details[0] feeds the column
